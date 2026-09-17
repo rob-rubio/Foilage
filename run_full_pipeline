@@ -1,0 +1,5 @@
+# shim so "python run_full_pipeline" (no .py) works
+import os, runpy, sys
+
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_full_pipeline.py"), run_name="__main__")
