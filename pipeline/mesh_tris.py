@@ -110,6 +110,14 @@ def mesh_domain(airfoil, dom_cfg, mesh_cfg, prefix,
     c_ps = geo.addSpline([te_pt] + ps_int + [le_pt])
     geo.synchronize()
 
+    # optional: force the wall discretization to a fixed node count per
+    # surface side (mesh.airfoil_points); without it Gmsh derives the wall
+    # spacing from the size fields
+    n_af = int(mesh_cfg.get("airfoil_points", 0) or 0)
+    if n_af > 10:
+        geo.mesh.setTransfiniteCurve(c_ss, n_af)
+        geo.mesh.setTransfiniteCurve(c_ps, n_af)
+
     # hole loop wound clockwise (solid on the left of travel): traverse the
     # upper surface LE->TE first, then the lower one TE->LE
     wall_loop = (geo.addCurveLoop([c_ss, c_ps]) if airfoil["ss_upper"]

@@ -32,7 +32,10 @@ import numpy as np
 REPO = Path(__file__).resolve().parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
+if str(REPO / "tools") not in sys.path:
+    sys.path.insert(0, str(REPO / "tools"))
 from foilage_config import resolve_su2_executable  # noqa: E402
+from freestream import gamma_of_air  # noqa: E402
 
 SUPPORTED_TURBULENCE_MODELS = {"SA", "SST"}
 DEFAULT_TURBULENCE_MODEL = "SA"
@@ -44,6 +47,22 @@ DEFAULT_NUMERICS = {
     "cfl_adapt": [0.1, 1.2, 5.0, 40.0],
     "linear_solver_iter": 100,
 }
+
+
+def load_gamma(cfg):
+    """Ratio of specific heats: explicit, or computed from the inlet total
+    temperature with the temperature-dependent specific heats of air."""
+    g = cfg.get("solver_settings", {}).get("gamma")
+    if g is not None:
+        g = float(g)
+        if not 1.05 < g < 1.75:
+            sys.exit(f"solver_settings.gamma = {g} looks wrong for a gas "
+                     "(expected ~1.2-1.7, air: 1.4)")
+        return g, f"set in input.json (gamma = {g})"
+    T01 = load_bc(cfg)[1]
+    g = gamma_of_air(T01)
+    return g, f"computed from inlet total temperature T01 = {T01:g} K " \
+              f"(gamma = {g:.4f})"
 
 
 def load_bc(cfg):
@@ -210,6 +229,8 @@ def main():
     case_root = args.mesh_case_dir.resolve()
     cfg = json.loads((case_root / "input.json").read_text())
     turbulence_model, max_iterations = load_solver_settings(cfg)
+    gamma, gamma_source = load_gamma(cfg)
+    print(f"[gamma] {gamma_source}")
     numerics = load_numerics(cfg)
     mesh_name = cfg["case"]["name"]
     su2_name = args.name or case_root.name
@@ -256,14 +277,14 @@ def main():
     p0, nrm, zoom = measure_surface_probe(pts, af)
 
     # ---- reference / init state
-    g, R = 1.4, 287.058
-    T2 = T01 * (p2 / p01) ** ((g - 1) / g)
-    V2 = math.sqrt(2 * g / (g - 1) * R * (T01 - T2))
+    R = 287.058
+    T2 = T01 * (p2 / p01) ** ((gamma - 1) / gamma)
+    V2 = math.sqrt(2 * gamma / (gamma - 1) * R * (T01 - T2))
     rho2 = p2 / (R * T2)
     mu2 = 1.716e-5 * (T2 / 273.15) ** 1.5 * (383.55 / (T2 + 110.4))
     Re = rho2 * V2 * scale / mu2
-    print(f"[refs] isentropic exit: M={V2/math.sqrt(g*R*T2):.3f} V={V2:.1f} m/s | "
-          f"Re_axial = {Re:.3g}, pitch = {pitch_m:.6f} m")
+    print(f"[refs] isentropic exit: M={V2/math.sqrt(gamma*R*T2):.3f} "
+          f"V={V2:.1f} m/s | Re_axial = {Re:.3g}, pitch = {pitch_m:.6f} m")
 
     case = {
         "name": su2_name,
@@ -279,7 +300,7 @@ def main():
             "reynolds_length": scale,
             "init_pressure": 100000.0,
             "init_temperature": 660.0,
-            "gamma": g,
+            "gamma": gamma,
             "gas_constant": R,
         },
         "cascade": {
@@ -292,6 +313,9 @@ def main():
         "markers": {
             "airfoil": {"bc": "wall_adiabatic"},
             "inlet": {"bc": "inlet", "analyze": True},
+            # outlet analysis -> per-surface Avg_*(outlet) history columns
+            # (GUI live mass-flow / imbalance plots)
+            "outlet": {"bc": "outlet", "analyze": True},
         },
         "numerics": numerics,
         "convergence": {"fields": ["RMS_DENSITY"], "minval": -6.0,
@@ -302,6 +326,10 @@ def main():
                       "normal": [round(float(nrm[0]), 4), round(float(nrm[1]), 4)],
                       "length": round(0.5 * scale, 6)},
             "zoom": {k: round(v, 6) for k, v in zoom.items()},
+            # suction side is the upper surface for clockwise turning (CAP),
+            # the lower one for counter-clockwise turning (CUP)
+            "ss_upper": float(cfg["airfoil"]["alpha2"])
+                        < float(cfg["airfoil"]["alpha1"]),
         },
     }
     (su2_dir / "case.json").write_text(json.dumps(case, indent=2))

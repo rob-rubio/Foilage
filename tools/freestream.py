@@ -15,6 +15,31 @@ def sutherland_mu(T, T_ref=273.15, mu_ref=1.71604e-5, S=110.4):
     return mu_ref * (T / T_ref) ** 1.5 * (T_ref + S) / (T + S)
 
 
+# thermal constant of the diatomic vibrational mode of air, SI
+# (NASA Glenn beginner's guide: theta = 5500 degrees Rankine)
+THETA_VIB_AIR_K = 5500.0 / 1.8
+GAMMA_PERFECT_AIR = 1.4
+
+
+def gamma_of_air(T):
+    """Ratio of specific heats of air at temperature T [K].
+
+    Calorically-imperfect harmonic-vibrator model, NASA Glenn
+    (equation of Eggers, NACA Report 959 / 1135):
+
+        gam = 1 + (gamp - 1) / (1 + (gamp - 1)
+                                * (th/T)^2 e^(th/T) / (e^(th/T) - 1)^2)
+
+    with gamp = 1.4 and th = 3055.6 K. Returns 1.400 at 300 K,
+    1.364 at 700 K, 1.335 at 1000 K.
+    """
+    th = THETA_VIB_AIR_K / float(T)
+    e = math.exp(th)
+    f = th * th * e / ((e - 1.0) ** 2)
+    g = GAMMA_PERFECT_AIR
+    return 1.0 + (g - 1.0) / (1.0 + (g - 1.0) * f)
+
+
 def state(mach, reynolds, reynolds_length=1.0, T_inf=288.15,
           gamma=1.4, R=287.058, reynolds_target=None):
     """Freestream dict consistent with (M, Re, L) at temperature T_inf.

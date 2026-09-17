@@ -34,6 +34,7 @@ input.json
 - Renders an SU2 v8 configuration from `case.json` and a template instead of requiring manual edits to the generated `.cfg`.
 - Launches SU2 in the background and displays residuals, force coefficients, mass flow, progress, and the recent solver log in a live Tk window.
 - Post-processes legacy VTK output into convergence, field, near-wall, and boundary-layer plots, then writes convergence, force, flow, loss, mass-balance, and wall `y+` metrics to `results.json`.
+- Ships a tabbed desktop GUI (`run_gui.py`) that edits `input.json` with smart widgets, previews the geometry interactively, views and generates meshes, runs the pipeline, and browses solutions - including importing saved `.vtk` files.
 
 ## Requirements
 
@@ -98,6 +99,29 @@ python run_full_pipeline.py cases\turbine_blade_4\input.json --name blade_trial 
 
 If no input path is given, the runner looks for `input.json` at the repository root. In this checkout, the runnable examples are under `cases\turbine_blade_*\input.json`, so passing the path explicitly is recommended.
 
+## GUI workflow
+
+The same workflow is available in a tabbed desktop GUI:
+
+```powershell
+python run_gui.py cases\turbine_blade_4\input.json
+```
+
+Without an argument the GUI loads the most recently modified `cases\*\input.json`. The top bar loads, reloads, and saves `input.json`; unsaved changes are flagged and the run auto-saves first. The tabs, in order:
+
+- **Geometry** - shows the normalized airfoil in its periodic passage (periodic edges and neighbouring blades included) and regenerates it live while you drag sliders or type exact values for the camberline, thickness, trailing-edge, flow-guidance, and domain parameters. Invalid combinations are reported instead of crashing.
+- **Setup** - edits the `case`, `BCs`, and `solver_settings`/`numerics` blocks with widgets that know their allowed values: turbulence model (SA/SST), slope limiter, gradient method, and mesh algorithm are dropdowns; boundary conditions get sliders plus exact entry boxes; arrays get expandable editors; gamma is either set explicitly (air: 1.4) or left on *auto*, which computes it from the inlet total temperature using the temperature-dependent specific heats of air (NASA Glenn's calorically-imperfect model, Eggers NACA Report 959: 1.400 at 300 K, 1.364 at 700 K). A live panel derives quantities from the current values (effective gamma and its source, pitch, pressure ratio, isentropic exit Mach/speed/temperature, axial Reynolds number) and a validation panel flags problems such as `R1 != R2` or an outlet pressure above the inlet total pressure before any solver time is wasted. The **Run mesh + solver** button saves the input, then runs geometry + Gmsh meshing, SU2 case setup with periodic validation, and the SU2 solver, streaming all stage output into the pipeline log. *Mesh + case only* and *Solve only* rerun subsets, and *Stop* terminates the current stage.
+- **Mesh** - edits the `mesh` block (far-field/near-wall/periodic sizes, mesh algorithm, wall node count, boundary-layer stack, wake refinement) with the same slider + exact-entry widgets, and views the result interactively with zoom, pan, and home (matplotlib navigation toolbar) over any mesh found for the case: the Gmsh tri mesh, the Blossom-recombined quad mesh (both in axial-chord units), and the scaled solver mesh in meters. Boundary markers overlay in color with toggles, the side panel reports node/element/marker counts and the `mesh_quality.txt` quality gate, and **Generate mesh** reruns the meshing pipeline on the current input.
+- **Solution** - while the solver runs, the canvas shows a 2x2 live view: residuals, force coefficients, mass flow at inlet and outlet, and the domain imbalance (continuity, energy, momentum flux in %, computed from SU2's per-surface `Avg_*(inlet)`/`Avg_*(outlet)` history columns; continuity and energy converge to ~0, momentum settles at the blade axial force). Once post-processing writes `results.json`, the tab populates automatically: metrics on the left, an interactive viewer on the right with two modes - **contour** (Mach, pressure, temperature, total pressure, total temperature, velocity magnitude, Cp, y+, skin friction magnitude, ... over the latest `vol_solution.vtk`, all in rainbow coloring with blue at the low end) and **1D surface** (isentropic Mach, skin friction, pressure coefficient, static pressure, and y+ as suction/pressure-side curves over the surface coordinate u, LE -> TE; the same data is exported to `ma_af.json` by post-processing) - filling the whole plot area, plus buttons for the generated PNGs. **Import .vtk ...** loads any saved SU2 legacy volume file into the same viewer.
+
+Developer checks that require no interaction:
+
+```powershell
+python run_gui.py --selftest   # schema/state/mesh/post-processing logic tests
+python run_gui.py --smoke      # builds the window, exercises every tab, exits
+```
+
+
 ## How the pipeline works
 
 ### 1. Input-driven geometry and meshing
@@ -111,7 +135,7 @@ The parametric input is divided into a few responsibilities:
 | `domain` | Passage extent, annulus radii, blade count, and periodic pitch |
 | `mesh` | Far-field size, near-wall size, boundary-layer growth, and wake refinement |
 | `BCs` | Total pressure/temperature/angle at the inlet and static pressure at the outlet |
-| `solver_settings` / `numerics` | Optional turbulence model, iteration count, CFL, limiter, and gradient settings |
+| `solver_settings` / `numerics` | Optional turbulence model, gamma, iteration count, CFL, limiter, and gradient settings |
 
 `pipeline\airfoil.py` uses `pyturbo-aero` with left-to-right flow orientation, handles CUP/CAP turning conventions, pins the shared leading/trailing-edge points, and returns suction-side, pressure-side, and closed-outline coordinates.
 
@@ -125,6 +149,8 @@ The parametric input is divided into a few responsibilities:
 - writes the initial `.msh`, `.su2`, and `.obj` files.
 
 `pipeline\quadify.py` extracts the recombined quads, retains any leftover triangles, fixes element orientation, re-orients marker edges to SU2's 2D convention, and writes the final solver mesh.
+
+`airfoil.n_points` sets how finely the pyturbo-aero splines sample the geometry. The number of mesh nodes along the wall is normally derived by Gmsh from the size fields; set `mesh.airfoil_points` (GUI: Mesh tab, "Nodes per surface side") to force an exact node count on each surface.
 
 The airfoil is normalized to one axial-chord unit during meshing. The setup stage later converts it to meters. By default, an `axial_chord` of `100.0` means `100 mm`, while a value below `1.0` is interpreted as meters; `tools\setup_cascade_case.py --scale` overrides this rule.
 
@@ -148,6 +174,8 @@ The mesh marker names and SU2 marker names are a strict contract:
 | `outlet` | Static-pressure outlet |
 | `periodic_bottom`, `periodic_top` | Translational periodic pair |
 | `fluid` | Gmsh 2D region group; not a boundary condition |
+
+The inlet and outlet are both added to SU2's `MARKER_ANALYZE`, which makes the solver write per-surface `Avg_*(inlet)`/`Avg_*(outlet)` history columns; the GUI's live mass-flow and imbalance plots read them.
 
 For SU2 periodicity to be a single rigid translation, the input requires `R1 == R2`. A varying-pitch unwrapped annulus is rejected because its two periodic edges cannot be paired by one constant translation.
 
@@ -178,7 +206,8 @@ After a run, `tools\plot_case.py` reads SU2's legacy VTK volume output and the c
 - `convergence.png` — residuals and force coefficients;
 - `fields.png` — Mach number and pressure coefficient;
 - `nearwall.png` — near-wall flow and mesh view;
-- `bl_validation.png` — boundary-layer profile and wall distributions; and
+- `bl_validation.png` — boundary-layer profile and wall distributions;
+- `ma_af.json` — suction/pressure-side surface distributions over the normalized surface coordinate `u` (0 at the LE, 1 at the TE): `ma` is the isentropic Mach number `Ma_is = sqrt(2/(gamma-1) * ((p01/p)^((gamma-1)/gamma) - 1))` built from the inlet total pressure and the local wall static pressure, and `cf` is the skin-friction coefficient magnitude. Schema: `{"ss": {"u": [...], "ma": [...], "cf": [...]}, "ps": {...}}`; and
 - `results.json` — convergence status, forces, maximum Mach, wall `y+`, and cascade mass-flow/loss audits when applicable.
 
 Run it manually when the solver has already finished:
@@ -221,12 +250,15 @@ This path is useful when geometry is easier to express directly in Gmsh GEO synt
 ## Repository layout
 
 ```text
-run_full_pipeline.py       One-command geometry -> mesh -> SU2 -> results driver
+run_gui.py                  Launch the tabbed GUI (setup/geometry/mesh/solution)
+run_full_pipeline.py        One-command geometry -> mesh -> SU2 -> results driver
 pipeline/                   Parametric airfoil and periodic cascade mesh pipeline
 tools/                      Case setup, SU2 rendering, monitoring, VTK parsing, plots
+foilage_gui/                GUI package: schema-driven forms, tabs, runner, viewers
 templates/                  SU2 configuration templates
 cases/                      Example inputs and generated local case artifacts
 resources/                  Project assets, including the Foilage logo
+future_features.md          Agreed, not-yet-implemented feature designs
 foilage.cfg.example         Template for the local SU2 path
 foilage_config.py           Runtime configuration and SU2 resolution
 requirements.txt            Python runtime dependencies

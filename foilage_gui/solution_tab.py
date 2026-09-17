@@ -1,0 +1,674 @@
+"""Solution tab: auto-populated results, field viewer, .vtk import, live monitor.
+
+- While the solver runs, the canvas shows the live convergence (history.csv
+  tail, same reader as tools/run_monitor.py).
+- When post-processing writes results.json, the tab populates automatically:
+  metrics on the left, latest vol_solution.vtk field on the right, plot
+  thumbnails below.
+- "Import .vtk..." loads any saved SU2 legacy volume file into the viewer.
+"""
+
+import json
+import queue
+import re
+import sys
+import threading
+import time
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, scrolledtext, ttk
+
+import matplotlib
+matplotlib.use("TkAgg")
+import numpy as np
+from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
+                                               NavigationToolbar2Tk)
+from matplotlib.figure import Figure
+
+REPO = Path(__file__).resolve().parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+TOOLS = REPO / "tools"
+if str(TOOLS) not in sys.path:
+    sys.path.insert(0, str(TOOLS))
+
+from run_monitor import HistoryTail, parse_cfg_totals  # noqa: E402
+from su2_vtk import read_legacy_vtk                    # noqa: E402
+from plot_case import (fields_from_volume,             # noqa: E402
+                       surface_distributions, volume_triangulation)
+
+RESULTS_POLL_MS = 1500
+LIVE_POLL_MS = 600
+
+# 1D surface-chart options: (dropdown label, key in surface_distributions,
+# y-axis label)
+SURFACE_QUANTITIES = [
+    ("isentropic Mach (Ma_is)", "ma_isen", "isentropic Mach number"),
+    ("skin friction (Cf)", "cf", "skin friction coefficient |Cf|"),
+    ("pressure coefficient (Cp)", "cp", "pressure coefficient Cp"),
+    ("static pressure (p)", "p", "static pressure [Pa]"),
+    ("y+ (wall)", "yplus", "wall y+"),
+]
+
+
+class SolutionTab(ttk.Frame):
+    def __init__(self, app):
+        super().__init__(app.notebook)
+        self.app = app
+        self._queue = queue.Queue()
+        self._results_mtime = None
+        self._vol_mtime = None
+        self._volume = None            # parsed vtk dict (case or imported)
+        self._volume_kind = None       # "case" | "imported"
+        self._fields = {}              # name -> (values, cmap)
+        self._field_names = []
+        self._live_tail = None
+        self._live_cfg = None
+        self._job_solving = False
+        self._busy = False
+        self._view_mode = None          # None | "field" | "live"
+        self._live_axes = None
+
+        # -------------------------------------------------------- top bar
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", padx=4, pady=(4, 0))
+        self.status_var = tk.StringVar(value="waiting for results.json - the "
+                                             "tab fills in automatically "
+                                             "after a run")
+        tk.Label(bar, textvariable=self.status_var, anchor="w",
+                 font=("TkDefaultFont", 8, "bold")).pack(side="left")
+        ttk.Button(bar, text="Reload", width=8, command=self.reload_all
+                   ).pack(side="right", padx=2)
+        ttk.Button(bar, text="Import .vtk ...", command=self.import_vtk
+                   ).pack(side="right", padx=2)
+
+        pane = ttk.PanedWindow(self, orient="horizontal")
+        pane.pack(fill="both", expand=True)
+
+        # --------------------------------------------------------- left
+        left = ttk.Frame(pane)
+        pane.add(left, weight=1)
+        box = ttk.LabelFrame(left, text=" Results summary (results.json) ")
+        box.pack(fill="both", expand=True, padx=4, pady=4)
+        self.metrics = scrolledtext.ScrolledText(
+            box, font=("Consolas", 9), width=52, state="disabled",
+            wrap="word")
+        self.metrics.pack(fill="both", expand=True, padx=2, pady=2)
+
+        self.thumbs_bar = ttk.Frame(left)
+        self.thumbs_bar.pack(fill="x", padx=4, pady=(0, 4))
+
+        # -------------------------------------------------------- right
+        right = ttk.Frame(pane)
+        pane.add(right, weight=2)
+        viewer_bar = ttk.Frame(right)
+        viewer_bar.pack(fill="x")
+        ttk.Label(viewer_bar, text="view:").pack(side="left", padx=(4, 2))
+        self.mode_var = tk.StringVar(value="contour")
+        self.mode_box = ttk.Combobox(viewer_bar, textvariable=self.mode_var,
+                                     state="readonly", width=10,
+                                     values=("contour", "1D surface"))
+        self.mode_box.pack(side="left")
+        self.mode_box.bind("<<ComboboxSelected>>",
+                           lambda _e: self._mode_changed())
+        ttk.Label(viewer_bar, text="quantity:").pack(side="left", padx=(10, 2))
+        self.field_var = tk.StringVar()
+        self.field_box = ttk.Combobox(viewer_bar, textvariable=self.field_var,
+                                      state="readonly", width=26)
+        self.field_box.pack(side="left")
+        self.field_box.bind("<<ComboboxSelected>>",
+                            lambda _e: self.draw_current())
+        self.viewer_note = tk.Label(viewer_bar, text="", anchor="e",
+                                    font=("TkDefaultFont", 8), fg="#595959")
+        self.viewer_note.pack(side="right", padx=6)
+
+        self.fig = Figure(figsize=(7.4, 5.6), dpi=96)
+        self.ax = None                  # created by _enter_field_view
+        self.canvas = FigureCanvasTkAgg(self.fig, master=right)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.toolbar = NavigationToolbar2Tk(self.canvas, right,
+                                            pack_toolbar=False)
+        self.toolbar.update()
+        self.toolbar.pack(side="bottom", fill="x")
+
+        # ------------------------------------------------------ polling
+        self._enter_field_view()
+        self.reload_all()
+        self.after(RESULTS_POLL_MS, self._poll_results)
+        self.after(LIVE_POLL_MS, self._poll_live)
+
+    # ---------------------------------------------------- view management
+    def _enter_field_view(self):
+        """Show exactly one full-size axes for the field plot."""
+        self._view_mode = "field"
+        self._live_axes = None
+        self.fig.clear()
+        self.ax = self.fig.add_subplot(111)
+
+    def _enter_live_view(self):
+        """Switch the canvas to the 2x2 live-convergence grid (idempotent)."""
+        if self._view_mode == "live" and self._live_axes is not None:
+            return
+        self._view_mode = "live"
+        self._live_axes = None
+        self.fig.clear()
+        self._live_axes = tuple(self.fig.add_subplot(n) for n in
+                                (221, 222, 223, 224))
+
+    # ------------------------------------------------------------ loading
+    def reload_all(self):
+        self._load_results(auto=True)
+        self._load_case_volume()
+        self._refresh_thumbnails()
+
+    def _load_results(self, auto=False):
+        path = self.app.state.case_dir() / "results.json"
+        if not path.exists():
+            if not auto:
+                self._set_metrics("no results.json in "
+                                  f"{self.app.state.case_dir()}")
+            return None
+        try:
+            data = json.loads(path.read_text())
+            self._results_mtime = path.stat().st_mtime
+            self._set_metrics(self._format_results(data, path))
+            self.status_var.set(
+                f"results.json loaded (written "
+                f"{time.strftime('%H:%M:%S', time.localtime(self._results_mtime))})"
+                f" - auto-reloads when a new run finishes")
+        except Exception as e:
+            self._set_metrics(f"failed to read results.json: {e}")
+            return None
+        return data
+
+    def _load_case_volume(self, force=False):
+        case_dir = self.app.state.case_dir()
+        vols = sorted(case_dir.glob("vol_solution*.vtk"))
+        if not vols:
+            return
+        path = vols[-1]
+        mtime = path.stat().st_mtime
+        if not force and self._volume_kind == "case" \
+                and mtime == self._vol_mtime:
+            return
+        if self._volume_kind == "imported" and not force:
+            return                     # keep an imported file on screen
+        self._vol_mtime = mtime
+        self._load_volume_async(path, kind="case")
+
+    def _load_volume_async(self, path, kind):
+        if self._busy:
+            return
+        self._busy = True
+        self.viewer_note.configure(text=f"loading {path.name} ...")
+        threading.Thread(target=self._volume_worker, args=(path, kind),
+                         daemon=True, name="vtk-load").start()
+        self.after(80, self._poll_volume)
+
+    def _volume_worker(self, path, kind):
+        try:
+            d = read_legacy_vtk(str(path))
+            fields = fields_from_volume(d)
+            self._queue.put(("ok", path, kind, d, fields))
+        except Exception as e:
+            self._queue.put(("error", path, kind, str(e), None))
+
+    def _poll_volume(self):
+        try:
+            status, path, kind, payload, fields = self._queue.get_nowait()
+        except queue.Empty:
+            self.after(80, self._poll_volume)
+            return
+        self._busy = False
+        if status == "error":
+            self.viewer_note.configure(text=f"failed to read {path.name}: {payload}")
+            return
+        self._volume = payload
+        self._volume_kind = kind
+        self._fields = fields
+        self._field_names = sorted(fields)
+        self._surf_cache_for = None
+        self._sync_quantity_choices()
+        self.draw_current()
+        n = len(payload["points"])
+        self.viewer_note.configure(text=
+            f"{path.name} ({n} nodes)"
+            + ("  [imported]" if kind == "imported" else ""))
+
+    # ------------------------------------------------------ quantity list
+    def _mode_changed(self):
+        self._sync_quantity_choices()
+        self.draw_current()
+
+    def _sync_quantity_choices(self):
+        """Fill the quantity dropdown for the active view mode."""
+        if self.mode_var.get() == "1D surface":
+            values = [q[0] for q in SURFACE_QUANTITIES]
+        else:
+            values = self._field_names
+        self.field_box.configure(values=values)
+        if values and self.field_var.get() not in values:
+            if self.mode_var.get() == "1D surface":
+                self.field_var.set(values[0])
+            else:
+                self.field_var.set("Mach" if "Mach" in values else values[0])
+
+    def draw_current(self):
+        if self._volume is None:
+            return
+        if self.mode_var.get() == "1D surface":
+            self.draw_surface()
+        else:
+            self.draw_field()
+
+    # ------------------------------------------------------------- viewer
+    def draw_field(self):
+        name = self.field_var.get()
+        if not name or name not in self._fields:
+            return
+        values, cmap = self._fields[name]
+        pts, conn = volume_triangulation(self._volume)
+        # full rebuild: guarantees the field owns the whole canvas and no
+        # live-convergence axes or stale colorbars survive
+        self._enter_field_view()
+        ax = self.ax
+        tc = ax.tricontourf(pts[:, 0], pts[:, 1], conn, values,
+                            levels=40, cmap=cmap)
+        ax.set_aspect("equal")
+        ax.set_xlim(pts[:, 0].min(), pts[:, 0].max())
+        ax.set_ylim(pts[:, 1].min(), pts[:, 1].max())
+        ax.set_title(name, fontsize=10)
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        self.fig.colorbar(tc, ax=ax, shrink=0.9, pad=0.01)
+        self.fig.tight_layout()
+        self.canvas.draw_idle()
+
+    def draw_surface(self):
+        """1D surface distributions (SS/PS curves over u in [0, 1])."""
+        dist = self._surface_distribution()
+        self._enter_field_view()
+        ax = self.ax
+        label, key, ylabel = next(
+            (q for q in SURFACE_QUANTITIES if q[0] == self.field_var.get()),
+            SURFACE_QUANTITIES[0])
+        if dist is None or key not in dist["ss"]:
+            reason = ("no wall nodes found in this volume" if dist is None
+                      else f"{key} not present in this solution")
+            ax.text(0.5, 0.5, reason, transform=ax.transAxes, ha="center",
+                    fontsize=9, color="0.4")
+            ax.set_title(label, fontsize=10)
+            self.canvas.draw_idle()
+            return
+        for side, color, name in (("ss", "tab:red", "suction side"),
+                                  ("ps", "tab:blue", "pressure side")):
+            s = dist[side]
+            ax.plot(s["u"], s[key], color=color, lw=1.4, label=name)
+        ax.set_xlabel("u  (LE -> TE)")
+        ax.set_ylabel(ylabel)
+        ax.set_title(f"{label} - surface distribution", fontsize=10)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+        self.fig.tight_layout()
+        self.canvas.draw_idle()
+
+    def _surface_distribution(self):
+        """Surface distributions of the loaded volume (cached per volume)."""
+        if self._volume is None:
+            return None
+        if getattr(self, "_surf_cache_for", None) is self._volume:
+            return self._surf_cache
+        d = self._volume
+        case = {}
+        case_path = self.app.state.case_dir() / "case.json"
+        if case_path.exists():
+            try:
+                case = json.loads(case_path.read_text())
+            except Exception:
+                case = {}
+        gamma = case.get("physics", {}).get("gamma", 1.4)
+        ss_upper = case.get("postprocess", {}).get("ss_upper", True)
+        flds = self._fields
+        if "cascade" in case:
+            cas = case["cascade"]
+            p0_ref = float(cas["inlet"]["total_pressure"])
+            p_ref = float(cas["outlet"]["static_pressure"])
+            v_ref = None
+            try:
+                from plot_case import cascade_refs
+                v_ref = cascade_refs(cas, case["physics"])["V2"]
+            except Exception:
+                v_ref = None
+        else:
+            p0_ref = p_ref = v_ref = None
+        if v_ref is None:
+            v_ref = float(flds["Velocity magnitude"][0].max()) \
+                if "Velocity magnitude" in flds else 1.0
+        if p0_ref is None:
+            p0_ref = float(flds["Total_Pressure"][0].max()) \
+                if "Total_Pressure" in flds else 1.0
+        if p_ref is None:
+            p_ref = float(flds["Pressure"][0].mean()) \
+                if "Pressure" in flds else 0.0
+        dist = surface_distributions(d, v_ref, p0_ref, gamma, p_ref=p_ref,
+                                     ss_upper=ss_upper)
+        self._surf_cache_for = self._volume
+        self._surf_cache = dist
+        return dist
+
+    def import_vtk(self):
+        case_dir = self.app.state.case_dir()
+        path = filedialog.askopenfilename(
+            title="Import SU2 legacy volume .vtk",
+            initialdir=str(case_dir if case_dir.exists() else Path.home()),
+            filetypes=[("VTK legacy", "*.vtk"), ("All files", "*.*")])
+        if path:
+            self._load_volume_async(Path(path), kind="imported")
+
+    # ------------------------------------------------------------- thumbs
+    def _refresh_thumbnails(self):
+        for child in self.thumbs_bar.winfo_children():
+            child.destroy()
+        case_dir = self.app.state.case_dir()
+        plots = [("convergence.png", "convergence"),
+                 ("fields.png", "fields"),
+                 ("nearwall.png", "near-wall"),
+                 ("bl_validation.png", "BL validation")]
+        found = False
+        for fname, label in plots:
+            path = case_dir / fname
+            if path.exists():
+                found = True
+                ttk.Button(self.thumbs_bar, text=label, width=13,
+                           command=lambda p=path: self._open_image(p)
+                           ).pack(side="left", padx=3)
+        if found:
+            ttk.Button(self.thumbs_bar, text="open folder", width=10,
+                       command=lambda: self._open_folder(case_dir)
+                       ).pack(side="right", padx=3)
+
+    def _open_image(self, path):
+        win = tk.Toplevel(self)
+        win.title(str(path))
+        try:
+            photo = tk.PhotoImage(file=str(path))   # Tk 8.6 reads PNG natively
+        except tk.TclError:
+            self._open_externally(path)
+            win.destroy()
+            return
+        w, h = photo.width(), photo.height()
+        win.geometry(f"{min(w, 1100) + 24}x{min(h, 800) + 24}")
+        canvas = tk.Canvas(win, highlightthickness=0)
+        hs = ttk.Scrollbar(win, orient="horizontal", command=canvas.xview)
+        vs = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
+        canvas.configure(xscrollcommand=hs.set, yscrollcommand=vs.set)
+        vs.pack(side="right", fill="y")
+        hs.pack(side="bottom", fill="x")
+        canvas.pack(fill="both", expand=True)
+        canvas.create_image(0, 0, image=photo, anchor="nw")
+        canvas.configure(scrollregion=(0, 0, w, h))
+        canvas.image = photo                        # keep a reference
+
+    @staticmethod
+    def _open_externally(path):
+        import os
+        if hasattr(os, "startfile"):
+            os.startfile(str(path))
+        else:
+            import subprocess
+            subprocess.Popen(["xdg-open", str(path)])
+
+    def _open_folder(self, path):
+        self._open_externally(path)
+
+    # ------------------------------------------------------------ summary
+    def _set_metrics(self, text):
+        self.metrics.configure(state="normal")
+        self.metrics.delete("1.0", "end")
+        self.metrics.insert("1.0", text)
+        self.metrics.configure(state="disabled")
+
+    def _format_results(self, r, path):
+        lines = [f"case: {r.get('case', self.app.state.case_name())}",
+                 f"file: {path}", "-" * 46]
+        c = r.get("convergence", {})
+        lines.append(f"iterations run : {c.get('iterations_run')}")
+        lines.append(f"target reached : {c.get('target_reached')} "
+                     f"(rms <= {c.get('target_rms')})")
+        for k, v in (c.get("rms_final") or {}).items():
+            lines.append(f"  {k:10s} = {v: .3f}")
+        f = r.get("forces", {})
+        if f:
+            lines.append(f"forces         : CD = {f.get('CD', 0):.4f}  "
+                         f"CL = {f.get('CL', 0):.4f}")
+        w = r.get("wall", {})
+        if w:
+            lines.append(f"wall y+        : median {w.get('yplus_median', 0):.1f}  "
+                         f"p95 {w.get('yplus_p95', 0):.1f}  "
+                         f"({w.get('wall_nodes')} nodes)")
+        lines.append(f"max Mach       : "
+                     f"{r.get('fields', {}).get('max_mach', 0):.3f}")
+        for plane in ("inlet", "outlet"):
+            p = r.get(plane)
+            if p:
+                lines.append("")
+                lines.append(f"{plane}:")
+                lines.append(f"  mass flow  : "
+                             f"{p.get('mass_flow_kg_s_m', 0):.4f} kg/(s.m)")
+                lines.append(f"  Mach       : {p.get('mach', 0):.3f}")
+                lines.append(f"  velocity   : {p.get('velocity_m_s', 0):.1f} m/s")
+                lines.append(f"  flow angle : {p.get('flow_angle_deg', 0):+.2f} deg")
+                lines.append(f"  static p   : {p.get('static_p_pa', 0):.1f} Pa")
+                lines.append(f"  total p    : {p.get('p0_pa', 0):.1f} Pa")
+        if "losses" in r:
+            lines.append("")
+            lines.append(f"total-pressure loss Yp : "
+                         f"{r['losses'].get('total_pressure_loss_coeff_Yp', 0):.4f}")
+        if "mass_balance" in r:
+            lines.append(f"mass-flow imbalance    : "
+                         f"{r['mass_balance'].get('imbalance_pct', 0):.3f} %")
+        extra = {k: v for k, v in r.items()
+                 if k not in ("case", "convergence", "forces", "wall",
+                              "fields", "inlet", "outlet", "losses",
+                              "mass_balance")}
+        if extra:
+            lines += ["", "additional data:", json.dumps(extra, indent=2)]
+        return "\n".join(lines)
+
+    # --------------------------------------------------------- live mode
+    def on_job_event(self, kind, data):
+        if kind == "stage":
+            if data["state"] == "start" and "SU2 solve" in data["title"]:
+                self._start_live()
+            elif data["state"] in ("ok", "failed", "stopped") \
+                    and "SU2 solve" in data["title"]:
+                self._stop_live(finished=data["state"] == "ok")
+        elif kind == "done":
+            # the watchdog writes results.json shortly after; keep polling
+            pass
+
+    def _start_live(self):
+        case_dir = self.app.state.case_dir()
+        cfg_path = case_dir / "turbine.cfg"
+        self._live_tail = HistoryTail(case_dir / "history.csv")
+        self._live_cfg = parse_cfg_totals(cfg_path)
+        self._job_solving = True
+        self.status_var.set("solver running - live convergence below "
+                            "(results.json will load automatically)")
+
+    def _stop_live(self, finished):
+        self._job_solving = False
+        self.status_var.set("solver stopped - waiting for post-processing "
+                            "to write results.json ...")
+
+    def _poll_live(self):
+        if self._job_solving and self._live_tail:
+            self._live_tail.poll()
+            self._draw_live()
+        self.after(LIVE_POLL_MS, self._poll_live)
+
+    def _draw_live(self):
+        tail = self._live_tail
+        kind, total = self._live_cfg
+        xcol = "Time_Iter" if (tail.get("Time_Iter")
+                               and max(tail.get("Time_Iter")) > 0) \
+            else ("Inner_Iter" if "Inner_Iter" in (tail.columns or [])
+                  else None)
+        x = tail.get(xcol) or []
+        self._enter_live_view()
+        ax_res, ax_f, ax_m, ax_b = self._live_axes
+
+        if not x:
+            for ax in self._live_axes:
+                ax.clear()
+                ax.grid(True, alpha=0.3)
+            ax_res.text(0.5, 0.5,
+                        f"waiting for history.csv ... ({tail.rows} rows)",
+                        transform=ax_res.transAxes, ha="center")
+            self.status_var.set("solver running - waiting for history.csv")
+            self.fig.tight_layout()
+            self.canvas.draw_idle()
+            return
+
+        x = np.asarray(x)
+        self._panel_residuals(ax_res, tail, x)
+        self._panel_forces(ax_f, tail, x)
+        self._panel_massflow(ax_m, tail, x)
+        self._panel_imbalance(ax_b, tail, x)
+        extra = f"   iter {x[-1]}/{total}" if total else f"   iter {x[-1]}"
+        self.status_var.set(f"solver running - live convergence{extra}")
+        self.fig.tight_layout()
+        self.canvas.draw_idle()
+
+    @staticmethod
+    def _panel_residuals(ax, tail, x):
+        ax.clear()
+        plotted = False
+        for col in (tail.columns or []):
+            if col.startswith("rms["):
+                ax.plot(x, tail.get(col), lw=1,
+                        label=col.replace("rms", "rms "))
+                plotted = True
+        ax.set_title("residuals (log10)", fontsize=9, loc="left")
+        ax.grid(True, alpha=0.3)
+        if plotted:
+            ax.legend(fontsize=6, ncol=2, loc="upper right")
+
+    @staticmethod
+    def _panel_forces(ax, tail, x):
+        ax.clear()
+        cd, cl = tail.get("CD"), tail.get("CL")
+        if cd:
+            ax.plot(x, cd, lw=1.1, color="tab:red", label="CD")
+        if cl:
+            ax.plot(x, cl, lw=1.1, color="tab:blue", label="CL")
+        ax.set_title("force coefficients", fontsize=9, loc="left")
+        ax.grid(True, alpha=0.3)
+        if cd or cl:
+            ax.legend(fontsize=6, loc="upper right")
+
+    def _panel_massflow(self, ax, tail, x):
+        """Mass flow at inlet and outlet (per-surface history columns)."""
+        ax.clear()
+        ax.set_title("mass flow  [kg/(s\u00b7m)]", fontsize=9, loc="left")
+        ax.grid(True, alpha=0.3)
+        cols = tail.columns or []
+        per_surface = {}
+        for col in cols:
+            m = re.match(r"Avg_Massflow\((.+)\)$", col.strip())
+            if m:
+                per_surface[m.group(1)] = col
+        if per_surface:
+            for marker, col in per_surface.items():
+                ax.plot(x, tail.get(col), lw=1.2, label=f"mdot {marker}")
+            ax.legend(fontsize=6, loc="upper right")
+            return
+        # older cases: only the aggregate (first analyzed marker) exists
+        mdot = tail.get("Avg_Massflow")
+        if mdot is None:
+            mdot = tail.get("SURFACE_MASSFLOW")
+        if mdot:
+            ax.plot(x, mdot, lw=1.2, color="tab:green", label="mdot inlet")
+            ax.legend(fontsize=6, loc="upper right")
+            ax.text(0.98, 0.05, "outlet needs FLOW_COEFF_SURF\n(re-run case "
+                    "setup)", transform=ax.transAxes, ha="right", va="bottom",
+                    fontsize=6, color="0.4")
+        else:
+            ax.text(0.5, 0.5, "no mass-flow columns in history.csv",
+                    transform=ax.transAxes, ha="center", fontsize=7,
+                    color="0.4")
+
+    @staticmethod
+    def _panel_imbalance(ax, tail, x):
+        """Domain imbalances in % from per-surface mass-averaged fluxes."""
+        ax.clear()
+        ax.set_title("domain imbalance  [%]", fontsize=9, loc="left")
+        ax.grid(True, alpha=0.3)
+        ax.axhline(0.0, color="k", ls=":", lw=0.8)
+        cols = tail.columns or []
+        col_set = set(c.strip() for c in cols)
+
+        def arr(prefix):
+            a = tail.get(f"{prefix}(inlet)")
+            b = tail.get(f"{prefix}(outlet)")
+            if a is None or b is None:
+                return None, None
+            return np.asarray(a), np.asarray(b)
+
+        mi, mo = arr("Avg_Massflow")
+        if mi is None:
+            ax.text(0.5, 0.5, "needs FLOW_COEFF_SURF history\n(re-run case "
+                    "setup)", transform=ax.transAxes, ha="center",
+                    fontsize=7, color="0.4")
+            return
+
+        def safe_ratio(a, b):
+            ok = np.abs(a) > 1e-12
+            out = np.zeros_like(np.asarray(a, dtype=float))
+            out[ok] = (np.asarray(a)[ok] - np.asarray(b)[ok]) / a[ok] * 100.0
+            return out
+
+        # SU2 per-surface mass flow uses outward boundary normals: inflow is
+        # positive at the inlet and NEGATIVE at the outlet, so conservation
+        # means the two fluxes SUM to ~0.
+        # continuity: (mdot_in + mdot_out) / mdot_in
+        plotted = [ax.plot(x, safe_ratio(mi, -mo), lw=1.1, color="tab:blue",
+                           label="continuity")[0]]
+        # energy: (mdot*cp*T0_in + mdot*cp*T0_out) / |mdot*cp*T0_in|, cp cancels
+        T0i, T0o = arr("Avg_TotalTemp")
+        if T0i is not None:
+            e_in = mi * T0i
+            e_out = mo * T0o
+            plotted.append(ax.plot(x, safe_ratio(e_in, -e_out), lw=1.1,
+                                   color="tab:red", label="energy (h0)")[0])
+        # momentum-flux density: rho*Vn^2 + p (mass-averaged); the passage
+        # areas at inlet/outlet are equal (R1 == R2) so they cancel in the
+        # ratio. NOTE: this settles at a constant equal to the blade axial
+        # force, NOT at zero.
+        rho_i, rho_o = arr("Avg_Density")
+        vn_i, vn_o = arr("Avg_NormalVel")
+        p_i, p_o = arr("Avg_Press")
+        if rho_i is not None and vn_i is not None and p_i is not None:
+            f_in = rho_i * vn_i ** 2 + p_i
+            f_out = rho_o * vn_o ** 2 + p_o
+            plotted.append(ax.plot(x, safe_ratio(f_in, f_out), lw=1.1,
+                                   color="tab:green",
+                                   label="momentum flux")[0])
+        # startup spikes (mdot passes through 0) must not flatten the scale
+        data = np.concatenate([ln.get_ydata() for ln in plotted]) \
+            if plotted else np.zeros(1)
+        span = float(np.percentile(np.abs(data), 90)) * 1.6
+        ax.set_ylim(-max(span, 1.0), max(span, 1.0))
+        ax.legend(fontsize=6, loc="upper right")
+
+    # ------------------------------------------------------ results poll
+    def _poll_results(self):
+        if not self._job_solving:
+            path = self.app.state.case_dir() / "results.json"
+            if path.exists():
+                mtime = path.stat().st_mtime
+                if self._results_mtime is None or mtime > self._results_mtime:
+                    self._load_results()
+                    self._load_case_volume(force=True)
+                    self._refresh_thumbnails()
+        self.after(RESULTS_POLL_MS, self._poll_results)

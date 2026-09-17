@@ -134,17 +134,64 @@ def load_volume(case_dir):
     vols = sorted(case_dir.glob("vol_solution*.vtk"))
     if not vols:
         raise FileNotFoundError(f"no vol_solution*.vtk in {case_dir}")
-    d = read_legacy_vtk(str(vols[-1]))
+    return read_legacy_vtk(str(vols[-1]))
+
+
+def fields_from_volume(d, gamma=GAMMA, r=R_AIR):
+    """Display-ready scalar fields from a parsed SU2 volume VTK dict.
+
+    Returns {display_name: (array_1d, cmap)} with one value per node:
+    vector fields (Skin_Friction_Coefficient, Momentum, ...) become their
+    magnitudes, and total pressure/temperature are derived from the
+    primitive fields. All contours use the classic rainbow (jet) map,
+    blue at the low end.
+    """
+    cmap = "jet"
+    out = {}
+    for name, arr in d.items():
+        if not isinstance(arr, np.ndarray) or arr.ndim != 2:
+            continue
+        if name in ("points", "tris", "quads"):
+            continue
+        if name == "Velocity":
+            out["Velocity magnitude"] = (
+                np.linalg.norm(arr[:, :2], axis=1), cmap)
+        elif arr.shape[1] == 1:
+            out[name] = (arr.ravel(), cmap)
+        else:
+            out[name] = (np.linalg.norm(arr, axis=1), cmap)
+
+    mach = d["Mach"].ravel() if "Mach" in d else None
+    if mach is None and "Velocity" in d and "Temperature" in d:
+        speed = np.linalg.norm(d["Velocity"][:, :2], axis=1)
+        mach = speed / np.sqrt(gamma * r * d["Temperature"].ravel())
+        d["Mach"] = mach.reshape(-1, 1)
+        out["Mach"] = (mach, cmap)
+    if mach is not None and "Pressure" in d:
+        fac = 1.0 + 0.5 * (gamma - 1.0) * mach ** 2
+        p = d["Pressure"].ravel()
+        out["Total_Pressure"] = (p * fac ** (gamma / (gamma - 1.0)), cmap)
+        if "Temperature" in d:
+            out["Total_Temperature"] = (d["Temperature"].ravel() * fac, cmap)
+    return out
+
+
+def volume_triangulation(d):
+    """(points, triangles) with quads split, ready for tricontourf/tripcolor."""
     pts = d["points"]
     parts = [d["tris"]]
     if d["quads"] is not None:
         q = d["quads"]
         parts += [q[:, [0, 1, 2]], q[:, [0, 2, 3]]]
     conn = np.vstack([p for p in parts if p is not None])
-    mach = d["Mach"].ravel()
-    cp = d["Pressure_Coefficient"].ravel()
-    vel = d["Velocity"][:, :2]
-    return d, pts, conn, mach, cp, vel
+    return pts, conn
+
+
+def _volume_arrays(d):
+    """(pts, conn, mach, cp, vel) from a parsed volume dict (legacy shape)."""
+    pts, conn = volume_triangulation(d)
+    return (pts, conn, d["Mach"].ravel(), d["Pressure_Coefficient"].ravel(),
+            d["Velocity"][:, :2])
 
 
 def plot_fields(case_dir, pts, conn, mach, cp):
@@ -292,6 +339,105 @@ def wall_points(pts, vel, V_ref):
     return wp[np.array(out)]
 
 
+def _wall_loop_indices(pts, vel, V_ref):
+    """Wall nodes as global indices, ordered LE -> TE -> LE by nearest
+    neighbor walk (same ordering as wall_points)."""
+    wall = np.linalg.norm(vel, axis=1) < 1e-6 * V_ref
+    wp = pts[wall]
+    if len(wp) < 10:
+        return None
+    walk = [int(np.argmin(np.linalg.norm(wp, axis=1)))]
+    used = {walk[0]}
+    for _ in range(len(wp) - 1):
+        last = wp[walk[-1]]
+        d = np.linalg.norm(wp - last, axis=1)
+        d[np.array(sorted(used))] = np.inf
+        nxt = int(np.argmin(d))
+        used.add(nxt)
+        walk.append(nxt)
+    return np.where(wall)[0][np.array(walk)]
+
+
+def surface_distributions(d, v_ref, p0_ref, gamma=GAMMA, p_ref=None,
+                          ss_upper=True):
+    """1D wall distributions split into suction/pressure sides.
+
+    Splits the ordered wall loop at the LE (x-min) and TE (x-max) into two
+    sides and normalizes surface arc length to u in [0, 1] (LE -> TE).
+    Isentropic Mach uses the classic turbomachinery definition with the
+    reference total pressure p0_ref (inlet p01) and the local wall static
+    pressure:  Ma_is = sqrt(2/(gamma-1) * ((p0/p)^((gamma-1)/gamma) - 1)).
+
+    Returns {"ss": {...}, "ps": {...}} or None when no wall nodes are
+    found. Per side: u, x, y, p, cf, ma_isen, cp, yplus (when available).
+    """
+    pts = d["points"]
+    vel = d["Velocity"][:, :2]
+    loop = _wall_loop_indices(pts, vel, v_ref)
+    if loop is None:
+        return None
+
+    x = pts[loop, 0]
+    i_le = int(np.argmin(x))
+    loop = np.roll(loop, -i_le)              # start at the LE
+    x = pts[loop, 0]
+    i_te = int(np.argmax(x))
+    side_a = loop[:i_te + 1]                     # LE -> TE along one side
+    side_b = np.concatenate([loop[i_te:], loop[:1]])  # TE -> LE (wrap)
+    side_b = side_b[::-1]                        # reversed: LE -> TE
+
+    upper = side_a if np.mean(pts[side_a, 1]) > np.mean(pts[side_b, 1]) \
+        else side_b
+    lower = side_b if upper is side_a else side_a
+    ss, ps = (upper, lower) if ss_upper else (lower, upper)
+
+    p_all = d["Pressure"].ravel()
+    cf_all = (np.linalg.norm(d["Skin_Friction_Coefficient"][:, :2], axis=1)
+              if "Skin_Friction_Coefficient" in d else None)
+    yp_all = d["Y_Plus"].ravel() if "Y_Plus" in d else None
+    if p_ref is None:
+        p_ref = float(np.median(p_all[loop]))
+
+    out = {}
+    for name, idx in (("ss", ss), ("ps", ps)):
+        xy = pts[idx]
+        seg = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+        s = np.concatenate([[0.0], np.cumsum(seg)])
+        u = s / s[-1] if s[-1] > 0 else s
+        p = p_all[idx]
+        ma_is = np.sqrt(np.clip(
+            2.0 / (gamma - 1.0) * ((p0_ref / p) ** ((gamma - 1.0) / gamma)
+                                   - 1.0), 0.0, None))
+        side = {"u": u, "x": xy[:, 0], "y": xy[:, 1], "p": p,
+                "ma_isen": ma_is,
+                "cp": (p - p_ref) / max(p0_ref - p_ref, 1e-12),
+                "cf": cf_all[idx] if cf_all is not None else np.zeros(len(idx))}
+        if yp_all is not None:
+            side["yplus"] = yp_all[idx]
+        out[name] = side
+    return out
+
+
+def write_ma_af(case_dir, dist):
+    """Export the surface distributions used by the GUI 1D charts.
+
+    Schema: {"ss": {"u": [...], "ma": [...], "cf": [...]},
+             "ps": {"u": [...], "ma": [...], "cf": [...]}}
+    with u the surface coordinate from 0 (LE) to 1 (TE), ma the isentropic
+    Mach number and cf the skin friction coefficient magnitude.
+    """
+    out = {}
+    for side in ("ss", "ps"):
+        s = dist[side]
+        out[side] = {"u": [float(v) for v in s["u"]],
+                     "ma": [float(v) for v in s["ma_isen"]],
+                     "cf": [float(v) for v in s["cf"]]}
+    path = Path(case_dir) / "ma_af.json"
+    path.write_text(json.dumps(out))
+    print(f"ma_af.json written ({len(out['ss']['u'])} ss / "
+          f"{len(out['ps']['u'])} ps points)")
+
+
 def plot_nearwall_cascade(case_dir, pp, pts, conn, vel, wp, V_ref):
     zoom = pp.get("zoom", {})
     x0, x1 = zoom.get("xmin", -0.01), zoom.get("xmax", 0.05)
@@ -382,7 +528,8 @@ def plot_wall_cascade(case_dir, pp, d, pts, vel, refs):
 
 
 # ------------------------------------------------------------- results.json
-def _read_history(path):
+def read_history(path):
+    """Parse an SU2 history.csv into {column: np.ndarray} (GUI-reusable)."""
     with open(path) as f:
         reader = csv.reader(f)
         header = [h.strip().strip('"').strip("'") for h in next(reader)]
@@ -394,6 +541,10 @@ def _read_history(path):
             except ValueError:
                 continue
     return {name: np.array(arr) for name, arr in zip(header, arrays)}
+
+
+# keep the historical private name working for any existing callers
+_read_history = read_history
 
 
 def _first_layer_height(case_dir):
@@ -458,7 +609,7 @@ def _first_layer_height(case_dir):
 def write_results(case_dir, case, fs):
     """Write results.json: convergence, forces, cascade plane audit, y+."""
     out = {"case": case_dir.resolve().name}
-    hist = _read_history(case_dir / "history.csv")
+    hist = read_history(case_dir / "history.csv")
 
     rms = {k: v for k, v in hist.items() if k.startswith("rms[")}
     minval = case.get("convergence", {}).get("minval", -6.0)
@@ -475,7 +626,8 @@ def write_results(case_dir, case, fs):
         "CL": float(hist["CL"][-1]),
     }
 
-    d, pts, conn, mach, cp, vel = load_volume(case_dir)
+    d = load_volume(case_dir)
+    pts, conn, mach, cp, vel = _volume_arrays(d)
     out["fields"] = {"max_mach": float(mach.max())}
 
     # wall y+ from skin friction
@@ -546,19 +698,30 @@ def main():
                case["physics"].get("gamma", 1.4), case["physics"].get("gas_constant", 287.058))
     pp = case.get("postprocess", {})
 
-    d, pts, conn, mach, cp, vel = load_volume(case_dir)
+    d = load_volume(case_dir)
+    pts, conn, mach, cp, vel = _volume_arrays(d)
     plot_convergence(case_dir, case_name, case.get("unsteady"))
     plot_fields(case_dir, pts, conn, mach, cp)
+    gamma = case["physics"].get("gamma", GAMMA)
+    ss_upper = case.get("postprocess", {}).get("ss_upper", True)
     if "cascade" in case:
         refs = cascade_refs(case["cascade"], case["physics"])
         wp = wall_points(pts, vel, refs["V2"])
         plot_nearwall_cascade(case_dir, pp, pts, conn, vel, wp, refs["V2"])
         plot_wall_cascade(case_dir, pp, d, pts, vel, refs)
+        dist = surface_distributions(d, refs["V2"], refs["p01"], gamma,
+                                     p_ref=refs["p2"], ss_upper=ss_upper)
+        if dist:
+            write_ma_af(case_dir, dist)
         print(f"cascade refs: M2_isen={refs['M2']:.3f}  V2={refs['V2']:.1f} m/s  "
               f"T2={refs['T2']:.1f} K")
     else:
         plot_nearwall(case_dir, pp, pts, conn, vel, fs["U_inf"])
         plot_bl_validation(case_dir, pp, d, pts, vel, fs)
+        dist = surface_distributions(d, fs["U_inf"], fs["p0"], gamma,
+                                     p_ref=fs["p_inf"], ss_upper=ss_upper)
+        if dist:
+            write_ma_af(case_dir, dist)
 
     write_results(case_dir, case, fs)
 
