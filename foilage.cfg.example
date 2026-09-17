@@ -1,0 +1,7 @@
+# Copy this file to foilage.cfg and set the SU2 installation location.
+# Relative paths are resolved relative to this configuration file.
+
+[su2]
+root = C:/path/to/SU2-v8.5.0-win64-omp
+# Alternatively, set the executable directly:
+# executable = C:/path/to/SU2-v8.5.0-win64-omp/bin/SU2_CFD.exe

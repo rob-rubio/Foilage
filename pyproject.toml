@@ -1,7 +1,17 @@
 [project]
-name = "cfd-2d"
+name = "foilage"
 version = "0.1.0"
-description = "Add your description here"
+description = "A Windows-first 2D computational-fluid-dynamics workflow for SU2"
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "gmsh==4.15.2",
+    "matplotlib==3.11.2",
+    "numpy==2.5.3",
+    "pyturbo-aero==1.3.8",
+    "scipy==1.18.1",
+]
+
+[project.urls]
+License = "https://www.gnu.org/licenses/gpl-3.0.html"

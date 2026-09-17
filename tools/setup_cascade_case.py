@@ -9,6 +9,7 @@ with a 2-iteration run, and prints (or with --run launches) the live monitor.
 Usage:
     python tools/setup_cascade_case.py <mesh_project_case_dir> [--name NAME]
         [--scale SCALE_M] [--remesh] [--skip-validate] [--run]
+        [--config foilage.cfg]
 
     <dir> points at e.g. ...\\Airfoil_generate_and_mesh\\cases\\turbine_blade_3
     (input.json sits there; the mesh lands in <dir>\\cases\\<mesh name>\\).
@@ -29,6 +30,10 @@ from pathlib import Path
 import numpy as np
 
 REPO = Path(__file__).resolve().parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+from foilage_config import resolve_su2_executable  # noqa: E402
+
 SUPPORTED_TURBULENCE_MODELS = {"SA", "SST"}
 DEFAULT_TURBULENCE_MODEL = "SA"
 DEFAULT_MAX_ITERATIONS = 6000
@@ -190,7 +195,17 @@ def main():
     ap.add_argument("--skip-validate", action="store_true")
     ap.add_argument("--run", action="store_true",
                     help="launch the live monitor when setup is done")
+    ap.add_argument("--config", type=Path, default=None,
+                    help="Foilage runtime config (default: foilage.cfg)")
     args = ap.parse_args()
+
+    if not args.skip_validate:
+        try:
+            su2_exe = resolve_su2_executable(args.config)
+        except (FileNotFoundError, ValueError) as e:
+            sys.exit(str(e))
+        if not su2_exe.exists():
+            sys.exit(f"SU2 not found at {su2_exe}")
 
     case_root = args.mesh_case_dir.resolve()
     cfg = json.loads((case_root / "input.json").read_text())
@@ -207,7 +222,7 @@ def main():
         mesh_src = case_root / "cases" / mesh_name / "mesh.su2"
     if args.remesh or not mesh_src.exists():
         proj = case_root.parent.parent
-        py = proj / "venv_afgnm" / "Scripts" / "python.exe"
+        py = Path(sys.executable)
         print(f"[mesh] running pipeline ({'--remesh' if args.remesh else 'mesh missing'}) ...")
         subprocess.run([str(py), str(proj / "pipeline" / "run_pipeline.py"),
                         str(case_root / "input.json")], check=True)
@@ -317,7 +332,7 @@ def main():
         text = re.sub(r"(?m)^CONV_STARTITER=[ \t]+\d+[ \t]*$",
                       "CONV_STARTITER= 2", text)
         (su2_dir / "validate.cfg").write_text(text)
-        r = subprocess.run([str(REPO / "SU2-v8.5.0-win64-omp" / "bin" / "SU2_CFD.exe"),
+        r = subprocess.run([str(su2_exe),
                             "-t", "6", "validate.cfg"],
                            cwd=str(su2_dir), capture_output=True, text=True, timeout=300)
         log = r.stdout + r.stderr
@@ -331,13 +346,16 @@ def main():
                   "surface.vtk", "surface.vtu"):
             (su2_dir / f).unlink(missing_ok=True)
 
-    run_cmd = (f'venv_2d_cfd\\Scripts\\python.exe tools\\run_monitor.py '
-               f'cases\\{su2_name} turbine.cfg -t 6')
+    run_cmd = (f'python tools\\run_monitor.py cases\\{su2_name} '
+               f'turbine.cfg -t 6')
     print(f"[done] SU2 case ready: {su2_dir}")
     print(f"[next] {run_cmd}")
     if args.run:
-        subprocess.Popen([sys.executable, str(REPO / "tools" / "run_monitor.py"),
-                          str(su2_dir), "turbine.cfg", "-t", "6"])
+        monitor_cmd = [sys.executable, str(REPO / "tools" / "run_monitor.py"),
+                       str(su2_dir), "turbine.cfg", "-t", "6"]
+        if args.config:
+            monitor_cmd += ["--config", str(args.config)]
+        subprocess.Popen(monitor_cmd)
 
 
 if __name__ == "__main__":

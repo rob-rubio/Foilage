@@ -1,7 +1,7 @@
 """Airfoil -> Gmsh triangles -> Blossom-recombined quads, driven by input.json.
 
 Usage:
-    venv_afgnm\\Scripts\\python.exe pipeline\\run_pipeline.py [input.json]
+    python pipeline\\run_pipeline.py [input.json]
 
 Stages:
     1. airfoil   : pyturbo-aero Airfoil2D, left_to_right=True, axial chord = 1

@@ -2,6 +2,7 @@
 
 Usage:
     python tools/run_monitor.py <case_dir> [cfg_name] [-t THREADS]
+        [--config foilage.cfg]
 
 Launches SU2_CFD on <case_dir>/<cfg_name> (default cylinder.cfg) as a
 background process and opens a Tk window with live panels:
@@ -15,6 +16,7 @@ Self-test (no solver, no window):
 """
 
 import csv
+import argparse
 import os
 import re
 import subprocess
@@ -31,7 +33,10 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
-SU2_EXE = REPO / "SU2-v8.5.0-win64-omp" / "bin" / "SU2_CFD.exe"
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+from foilage_config import resolve_su2_executable  # noqa: E402
+
 POLL_MS = 500
 LOG_TAIL_LINES = 8
 
@@ -161,9 +166,11 @@ def selftest():
 
 # ----------------------------------------------------------------------- GUI
 class MonitorApp:
-    def __init__(self, case_dir: Path, cfg_name: str, threads: int):
+    def __init__(self, case_dir: Path, cfg_name: str, threads: int,
+                 su2_exe: Path):
         self.case_dir = case_dir
         self.cfg_name = cfg_name
+        self.su2_exe = su2_exe
         self.cfg_path = case_dir / cfg_name
         self.log_path = case_dir / "su2_run.log"
         self.tail = HistoryTail(case_dir / "history.csv")
@@ -211,7 +218,7 @@ class MonitorApp:
         self.log_box.insert("1.0", "waiting for output ...")
 
     def _start_solver(self, threads):
-        cmd = [str(SU2_EXE), "-t", str(threads), self.cfg_name]
+        cmd = [str(self.su2_exe), "-t", str(threads), self.cfg_name]
         try:
             logf = open(self.log_path, "w")
             self.proc = subprocess.Popen(cmd, cwd=str(self.case_dir),
@@ -353,19 +360,30 @@ class MonitorApp:
 
 
 def main():
-    if "--selftest" in sys.argv:
+    ap = argparse.ArgumentParser(description="Run SU2 with a live convergence monitor")
+    ap.add_argument("case_dir", nargs="?", type=Path)
+    ap.add_argument("cfg_name", nargs="?", default="cylinder.cfg")
+    ap.add_argument("-t", "--threads", type=int, default=6)
+    ap.add_argument("--config", type=Path, default=None,
+                    help="Foilage runtime config (default: foilage.cfg)")
+    ap.add_argument("--selftest", action="store_true")
+    args = ap.parse_args()
+
+    if args.selftest:
         selftest()
         return
-    if not SU2_EXE.exists():
-        sys.exit(f"SU2 not found at {SU2_EXE}")
-    case_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
+    if args.case_dir is None:
+        ap.error("case_dir is required unless --selftest is used")
+    try:
+        su2_exe = resolve_su2_executable(args.config)
+    except (FileNotFoundError, ValueError) as e:
+        sys.exit(str(e))
+    if not su2_exe.exists():
+        sys.exit(f"SU2 not found at {su2_exe}")
+    case_dir = args.case_dir
     if not case_dir.exists():
         sys.exit(f"case dir not found: {case_dir}")
-    cfg_name = sys.argv[2] if len(sys.argv) > 2 else "cylinder.cfg"
-    threads = 6
-    if "-t" in sys.argv:
-        threads = int(sys.argv[sys.argv.index("-t") + 1])
-    MonitorApp(case_dir.resolve(), cfg_name, threads).run()
+    MonitorApp(case_dir.resolve(), args.cfg_name, args.threads, su2_exe).run()
 
 
 if __name__ == "__main__":

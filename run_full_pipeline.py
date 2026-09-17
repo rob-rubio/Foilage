@@ -2,7 +2,7 @@
 
 Usage (any cwd, from anywhere):
     python run_full_pipeline [INPUT_JSON] [--name NAME] [--threads N]
-                             [--skip-mesh] [--no-run]
+                             [--skip-mesh] [--no-run] [--config foilage.cfg]
 
 INPUT_JSON defaults to <repo>/input.json; a per-case input like
 cases/turbine_blade_4/input.json works too. Stages:
@@ -29,9 +29,9 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
-PY = REPO / "venv_2d_cfd" / "Scripts" / "python.exe"
-if not PY.exists():
-    PY = Path(sys.executable)  # fall back to whatever python is running us
+# Use the interpreter that launched this command. The project intentionally
+# does not ship a virtual environment; users create one with uv or pip.
+PY = Path(sys.executable)
 
 
 def stage(title, cmd, **kw):
@@ -83,6 +83,8 @@ def main():
                     help="reuse the existing mesh, start at SU2 setup")
     ap.add_argument("--no-run", action="store_true",
                     help="stop after setup (no solve)")
+    ap.add_argument("--config", type=Path, default=None,
+                    help="Foilage runtime config (default: foilage.cfg)")
     args = ap.parse_args()
 
     inp = Path(args.input) if args.input else REPO / "input.json"
@@ -104,9 +106,12 @@ def main():
               [str(PY), str(REPO / "pipeline" / "run_pipeline.py"), str(inp)],
               cwd=str(REPO))
 
+    setup_cmd = [str(PY), str(REPO / "tools" / "setup_cascade_case.py"),
+                 str(inp.parent), "--name", name]
+    if args.config:
+        setup_cmd += ["--config", str(args.config)]
     stage("2/3  SU2 case setup (BCs from input.json, mesh scaled to meters)",
-          [str(PY), str(REPO / "tools" / "setup_cascade_case.py"),
-           str(inp.parent), "--name", name])
+          setup_cmd)
 
     if args.no_run:
         print(f"\ncase ready: {REPO / 'cases' / name}  "
@@ -115,10 +120,13 @@ def main():
 
     print(f"\nThe live convergence window is opening; post-processing runs "
           f"automatically when the solve stops or finishes.\n")
+    monitor_cmd = [str(PY), str(REPO / "tools" / "run_monitor.py"),
+                   str(REPO / "cases" / name), "turbine.cfg",
+                   "-t", str(args.threads)]
+    if args.config:
+        monitor_cmd += ["--config", str(args.config)]
     stage(f"3/3  SU2 solve + live monitor ({args.threads} threads)",
-          [str(PY), str(REPO / "tools" / "run_monitor.py"),
-           str(REPO / "cases" / name), "turbine.cfg",
-           "-t", str(args.threads)])
+          monitor_cmd)
 
     res = REPO / "cases" / name / "results.json"
     if res.exists():
