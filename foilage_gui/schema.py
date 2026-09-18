@@ -221,15 +221,19 @@ SECTIONS = [
     ]),
     Section("geometry", "Domain (periodic passage)", [
         FieldSpec("domain.R1", "Annulus radius at LE (R1)", "float", 9.0,
-                  1.0, 60.0, slider=True,
-                  tooltip="Sets the pitch at the leading edge: "
-                          "p_le = 2 pi R1 / N. Must equal R2 for SU2 "
-                          "periodicity."),
+                  0.01, 2000.0, slider=True, unit="mm",
+                  tooltip="Actual annulus radius at the leading-edge axial "
+                          "station, in the same units as axial chord (mm by "
+                          "default). Sets the pitch there: p_LE = 2 pi R1 / "
+                          "N. Must equal R2 for SU2 periodicity. "
+                          "Auto-filled when a geomTurbo file is imported."),
         FieldSpec("domain.R2", "Annulus radius at TE (R2)", "float", 9.0,
-                  1.0, 60.0, slider=True,
-                  tooltip="Sets the pitch at the trailing edge. "
-                          "Must equal R1 for a single-translation "
-                          "periodic pair."),
+                  0.01, 2000.0, slider=True, unit="mm",
+                  tooltip="Actual annulus radius at the trailing-edge axial "
+                          "station, in the same units as axial chord. Sets "
+                          "the pitch there: p_TE = 2 pi R2 / N. Must equal "
+                          "R1 for a single-translation periodic pair. "
+                          "Auto-filled when a geomTurbo file is imported."),
         FieldSpec("domain.airfoil_count", "Blade count N", "int", 45,
                   2, 300, step=1,
                   tooltip="Blades around the full annulus; pitch = 2 pi R / N."),

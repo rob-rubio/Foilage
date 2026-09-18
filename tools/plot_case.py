@@ -423,13 +423,29 @@ def surface_distributions(d, v_ref, p0_ref, gamma=GAMMA, p_ref=None,
         ma_is = np.sqrt(np.clip(
             2.0 / (gamma - 1.0) * ((p0_ref / p) ** ((gamma - 1.0) / gamma)
                                    - 1.0), 0.0, None))
+        # back-surface diffusion factor (Lieblein): the fractional
+        # deceleration downstream of the surface velocity peak,
+        # DF(u) = 1 - V(u)/V_peak, with V proportional to Ma_is at
+        # constant stagnation temperature. Upstream of the peak DF = 0.
+        peak = int(np.argmax(ma_is))
+        ma_peak = float(np.max(ma_is))
+        diffusion = np.zeros_like(ma_is)
+        diffusion[peak:] = 1.0 - ma_is[peak:] / max(ma_peak, 1e-12)
         side = {"u": u, "x": xy[:, 0], "y": xy[:, 1], "p": p,
                 "ma_isen": ma_is,
                 "cp": (p - p_ref) / max(p0_ref - p_ref, 1e-12),
+                "diffusion": diffusion,
                 "cf": cf_all[idx] if cf_all is not None else np.zeros(len(idx))}
         if yp_all is not None:
             side["yplus"] = yp_all[idx]
         out[name] = side
+        # 0-D back-surface diffusion factor at the trailing edge
+        out.setdefault("summary", {})[name] = {
+            "DF": float(1.0 - ma_is[-1] / max(ma_peak, 1e-12)),
+            "ma_peak": ma_peak,
+            "ma_te": float(ma_is[-1]),
+            "peak_u": float(u[peak]),
+        }
     return out
 
 
@@ -621,7 +637,7 @@ def _first_layer_height(case_dir):
     return float(np.min(heights)), float(np.median(heights))
 
 
-def write_results(case_dir, case, fs):
+def write_results(case_dir, case, fs, dist=None):
     """Write results.json: convergence, forces, cascade plane audit, y+."""
     out = {"case": case_dir.resolve().name}
     hist = read_history(case_dir / "history.csv")
@@ -699,6 +715,12 @@ def write_results(case_dir, case, fs):
         md_o = out["outlet"]["mass_flow_kg_s_m"]
         out["mass_balance"] = {"imbalance_pct": float(abs(md_i - md_o) / md_i * 100)}
 
+    if dist and dist.get("summary"):
+        out["back_surface_diffusion"] = {
+            side: {"DF": round(vals["DF"], 4),
+                   "ma_peak": round(vals["ma_peak"], 4),
+                   "peak_u": round(vals["peak_u"], 4)}
+            for side, vals in dist["summary"].items()}
     (case_dir / "results.json").write_text(json.dumps(out, indent=2))
     print("results.json written")
 
@@ -743,7 +765,7 @@ def main():
         if dist:
             write_ma_af(case_dir, dist)
 
-    write_results(case_dir, case, fs)
+    write_results(case_dir, case, fs, dist=dist)
 
 
 if __name__ == "__main__":

@@ -105,7 +105,8 @@ def test_geomturbo_import():
     from pipeline.airfoil import build_airfoil, build_geometry
     from pipeline.cascade_metrics import channel_widths, curvature, \
         throat_metrics
-    from pipeline.geomturbo import (parse_geomturbo, section_to_airfoil,
+    from pipeline.geomturbo import (infer_cascade_parameters,
+                                    parse_geomturbo, section_to_airfoil,
                                     write_geomturbo)
 
     cfg = json.loads((REPO / "cases" / "turbine_blade_9" / "input.json")
@@ -113,13 +114,27 @@ def test_geomturbo_import():
     ref = build_airfoil(cfg["airfoil"])
 
     # Exercise the native NUMECA layout: separate SECTIONAL suction and
-    # pressure blocks, two spanwise sections, and file-order Z Y X rows.
+    # pressure blocks, two spanwise sections, file-order Z Y X rows, a
+    # blade count, and CHANNEL hub/shroud zrcurves (constant radii 0.45 /
+    # 0.55 m so the inferred mid-span radius is 0.50 m at any station).
     ss, ps = ref["ss"], ref["ps"]
     with tempfile.TemporaryDirectory() as tmp:
         gt = Path(tmp) / "test.geomTurbo"
         scale = 0.105
         lines = [
             "TYPE GEOMTURBO", "GEOMETRY TURBO VERSION 5", "units 1",
+            "NI_BEGIN CHANNEL",
+            " NI_BEGIN basic_curve", " NAME hub",
+            " NI_BEGIN zrcurve", "ZR", "2",
+            f"{-0.05 * scale:.9f} 0.450000000",
+            f"{0.20 * scale:.9f} 0.450000000",
+            " NI_END zrcurve", " NI_END basic_curve",
+            " NI_BEGIN basic_curve", " NAME shroud",
+            " NI_BEGIN zrcurve", "ZR", "2",
+            f"{-0.05 * scale:.9f} 0.550000000",
+            f"{0.20 * scale:.9f} 0.550000000",
+            " NI_END zrcurve", " NI_END basic_curve",
+            "NI_END CHANNEL",
             "NI_BEGIN nibladegeometry", "number_of_blades 20",
             "suction", "SECTIONAL", "2",
         ]
@@ -142,10 +157,23 @@ def test_geomturbo_import():
         assert len(parsed["sections"]) == 2
         assert parsed["sections"][0]["ss"].shape == (len(ss), 3)
         assert parsed["sections"][0]["ps"].shape == (len(ps), 3)
+        assert parsed["hub"] is not None and parsed["shroud"] is not None
+
+        inf = infer_cascade_parameters(parsed, 0)
+        assert inf["blade_count"] == 20
+        assert abs(inf["axial_chord"] - 0.105 * 1.01) < 5e-3, \
+            f"axial chord {inf['axial_chord']}"
+        # R1/R2 = LE/TE point radii about the machine axis: sqrt(y^2+z^2).
+        # Section 0 has z = 0, so the radius is |y| at each edge point.
+        assert abs(inf["R1"] - abs(ref["ss"][0, 1]) * scale) < 1e-6, \
+            f"R1 {inf['R1']}"
+        assert abs(inf["R2"] - abs(ref["ss"][-1, 1]) * scale) < 1e-6, \
+            f"R2 {inf['R2']}"
 
         cfg["airfoil_source"] = {"type": "geomturbo", "geomturbo_file": str(gt),
                                  "section": 0}
         af = build_geometry(cfg)
+    assert af["axial_chord"] == float(cfg["airfoil"]["axial_chord"])
     n = int(cfg["airfoil"]["n_points"])
     assert len(af["ss"]) in (n, n + 1), f"ss points {len(af['ss'])}"
     xmin = min(af["ss"][:, 0].min(), af["ps"][:, 0].min())
@@ -158,16 +186,39 @@ def test_geomturbo_import():
            (ref["ss"][:, 1].mean() > ref["ps"][:, 1].mean())
     assert af["style"] == "geomTurbo import"
 
+    # real-file check: the igv643 sample's section-0 LE point is
+    # (z, y, x) = (5.3983301E-02, -1.8840518E-02, -5.8218479E-02), so the
+    # LE radius is sqrt(z^2 + y^2) ~= 0.0572 m (user-reported value)
+    igv = REPO / "sample" / "geomturbo_external" / "igv643.geomTurbo"
+    if igv.exists():
+        inf2 = infer_cascade_parameters(parse_geomturbo(igv), 0)
+        assert abs(inf2["R1"] - 0.05717) < 2e-3, \
+            f"igv643 R1 {inf2['R1']:.5f} != ~0.0572"
+        print(f"igv643 check: R1 = {inf2['R1']:.4f} m, "
+              f"R2 = {inf2['R2']:.4f} m, ac = {inf2['axial_chord']:.4f} m")
+
     # channel/throat/curvature sanity on the reference blade at a
     # realistic pitch (blade_9's own pitch is very coarse, s/c = 1.26,
-    # which degenerates the throat toward the TE tail)
-    cfg["domain"]["R1"] = cfg["domain"]["R2"] = 7.0
+    # which degenerates the throat toward the TE tail). R1/R2 are actual
+    # units (mm) and are normalized by the axial chord internally.
+    cfg["domain"]["R1"] = cfg["domain"]["R2"] = 700.0    # mm -> 7.0 c_ax
     cfg["domain"]["airfoil_count"] = 90          # s/c ~ 0.49
+    ref["axial_chord"] = float(cfg["airfoil"]["axial_chord"])
     from pipeline.mesh_tris import pitch_profile
     prof = pitch_profile(cfg["domain"], ref)
-    s_ch, _j = channel_widths(ref["ss"], ref["ps"], prof["p_le"])
+    s_ch, _j = channel_widths(ref["ss"], ref["ps"], prof["p_le"],
+                              ref["ss_upper"])
+    # CUP mirror check: flipping the blade vertically must give the same
+    # channel widths (the neighbor direction flips with the surfaces)
+    ss_m = ref["ss"].copy()
+    ps_m = ref["ps"].copy()
+    ss_m[:, 1] *= -1.0
+    ps_m[:, 1] *= -1.0
+    s_ch_m, _j = channel_widths(ss_m, ps_m, prof["p_le"],
+                                not ref["ss_upper"])
+    assert np.abs(s_ch - s_ch_m).max() < 1e-9, "CUP/CAP channel mismatch"
     assert 0.05 < s_ch.min() < prof["p_le"], "throat width out of range"
-    t = throat_metrics(ref["ss"], ref["ps"], prof["p_le"])
+    t = throat_metrics(ref["ss"], ref["ps"], prof["p_le"], ref["ss_upper"])
     assert 0.1 < t["x_over_cax"] < 0.95
     assert 0.0 < t["unguided_turning_deg"] < 45.0
     assert t["width"] > 0
@@ -212,6 +263,30 @@ def test_su2_mesh_reader():
           f"{len(mesh['quads'])} quads, {len(mesh['markers'])} markers)")
 
 
+def test_geomturbo_external_samples():
+    """Parse locally downloaded public samples when available."""
+    sample_dir = REPO / "sample" / "geomturbo_external"
+    files = sorted(sample_dir.glob("*.geomTurbo"))
+    if not files:
+        print("external geomTurbo samples SKIPPED (none downloaded)")
+        return
+
+    from pipeline.geomturbo import parse_geomturbo
+    for path in files:
+        parsed = parse_geomturbo(path)
+        assert parsed["blade_count"] > 0
+        assert parsed["sections"]
+        assert parsed["blade_geometries"]
+        for geometry in parsed["blade_geometries"]:
+            assert geometry["sections"]
+            for section in geometry["sections"]:
+                for side in ("ss", "ps"):
+                    points = section[side]
+                    assert points.ndim == 2 and points.shape[1] == 3
+                    assert len(points) >= 2 and np.isfinite(points).all()
+    print(f"external geomTurbo samples OK ({len(files)} files)")
+
+
 def test_postproc_integration():
     tools = str(REPO / "tools")
     if tools not in sys.path:
@@ -242,6 +317,7 @@ def main():
     test_derived()
     test_gamma_model()
     test_geomturbo_import()
+    test_geomturbo_external_samples()
     test_su2_mesh_reader()
     test_postproc_integration()
     print("selftest OK")

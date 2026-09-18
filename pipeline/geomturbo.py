@@ -14,6 +14,7 @@ fallback for files produced by earlier Foilage versions.  It cannot provide
 explicit SS/PS arrays, so callers should prefer native files.
 """
 
+import math
 import re
 from pathlib import Path
 
@@ -177,6 +178,44 @@ def _units_scale(lines):
     return None
 
 
+def _parse_channel(lines):
+    """Extract hub/shroud ``zrcurve`` polylines from the CHANNEL block.
+
+    Returns (hub, shroud) as ``(n, 2)`` arrays of (z, r) sorted by z, or
+    ``None`` for each when the machine file does not define them.
+    """
+    curves = {}
+    name = None
+    index = 0
+    in_channel = False
+    while index < len(lines):
+        stripped = lines[index].strip()
+        upper = stripped.upper()
+        if upper.startswith("NI_BEGIN CHANNEL"):
+            in_channel = True
+        elif upper.startswith("NI_END CHANNEL"):
+            break
+        if upper.startswith("NAME") and len(stripped.split()) >= 2:
+            name = stripped.split(None, 1)[1].strip().lower()
+        if in_channel and name in {"hub", "shroud"} and upper == "ZR":
+            index = _skip_comments(lines, index + 1)
+            count = _integer_line(lines[index].strip()) if index < len(lines) \
+                else None
+            if count and count >= 2:
+                index = _skip_comments(lines, index + 1)
+                rows = []
+                while len(rows) < count and index < len(lines):
+                    values = _numeric_row(lines[index].strip(), 2)
+                    if values is not None:
+                        rows.append(values[:2])
+                    index += 1
+                curve = np.asarray(rows, dtype=float)
+                curve = curve[np.argsort(curve[:, 0])]
+                curves.setdefault(name, curve)
+        index += 1
+    return curves.get("hub"), curves.get("shroud")
+
+
 def _native_geometry_blocks(lines):
     blocks = []
     start = None
@@ -235,11 +274,14 @@ def _parse_native(lines, path):
     if not geometries:
         return None
     result = geometries[0]
+    hub, shroud = _parse_channel(lines)
     return {
         "blade_count": result["blade_count"],
         "sections": result["sections"],
         "blade_geometries": geometries,
         "units": _units_scale(lines),
+        "hub": hub,
+        "shroud": shroud,
     }
 
 
@@ -514,3 +556,50 @@ def section_to_airfoil(points, n_points=401):
     outline = np.vstack([upper, lower[::-1][1:-1]])
     return {"ss": ss, "ps": ps, "outline": outline,
             "ss_upper": ss_upper, "style": "geomTurbo import"}
+
+
+def infer_cascade_parameters(parsed, section_index=0):
+    """Infer cascade inputs from a parsed geomTurbo (all in file units).
+
+    Returns a dict with:
+
+    - ``axial_chord``: LE -> suction-side trailing point axial distance of
+      the selected section (same anchor section_to_airfoil normalizes by);
+    - ``blade_count``: the blade count stored in the file;
+    - ``R1`` / ``R2``: the *radius of the leading/trailing-edge point*,
+      i.e. its distance from the machine axis: ``sqrt(y^2 + z^2)`` using
+      the canonical coordinates (x is the machine axis). The LE/TE points
+      are the SS/PS end points averaged; for a legacy 2-D section without
+      z data the radius falls back to ``|y|``.
+    """
+    sections = parsed.get("sections") or []
+    if not sections:
+        return None
+    idx = max(0, min(int(section_index or 0), len(sections) - 1))
+    sec = sections[idx]
+
+    if sec.get("ss") is not None and sec.get("ps") is not None:
+        sides = []
+        for side in (sec["ss"], sec["ps"]):
+            s = np.asarray(side, dtype=float)[:, :3]
+            if s[0, 0] > s[-1, 0]:
+                s = s[::-1]
+            sides.append(s)
+        ss3, ps3 = sides
+        le = 0.5 * (ss3[0] + ps3[0])           # averaged LE point (x y z)
+        te = 0.5 * (ss3[-1] + ps3[-1])         # averaged TE point
+    else:
+        pts = np.asarray(sec["points"], dtype=float)[:, :3]
+        le = pts[int(np.argmin(pts[:, 0]))]
+        te = pts[int(np.argmax(pts[:, 0]))]
+    x_le, x_te = float(le[0]), float(te[0])
+    axial_chord = max(x_te - x_le, 1e-12)
+
+    # radius of each edge point about the machine axis (x): sqrt(y^2+z^2)
+    r1 = float(math.hypot(le[1], le[2]))
+    r2 = float(math.hypot(te[1], te[2]))
+
+    return {"axial_chord": axial_chord,
+            "blade_count": parsed.get("blade_count"),
+            "R1": r1, "R2": r2,
+            "x_le": x_le, "x_te": x_te}

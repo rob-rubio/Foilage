@@ -24,6 +24,7 @@ import numpy as np
 from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
                                                NavigationToolbar2Tk)
 from matplotlib.figure import Figure
+from scipy.interpolate import griddata
 
 REPO = Path(__file__).resolve().parent.parent
 if str(REPO) not in sys.path:
@@ -34,7 +35,7 @@ if str(TOOLS) not in sys.path:
 
 from run_monitor import HistoryTail, parse_cfg_totals  # noqa: E402
 from su2_vtk import read_legacy_vtk                    # noqa: E402
-from plot_case import (fields_from_volume,             # noqa: E402
+from plot_case import (fields_from_volume, wall_points,  # noqa: E402
                        surface_distributions, volume_triangulation)
 
 from .widgets import Tooltip                           # noqa: E402
@@ -46,6 +47,8 @@ LIVE_POLL_MS = 600
 # y-axis label)
 SURFACE_QUANTITIES = [
     ("isentropic Mach (Ma_is)", "ma_isen", "isentropic Mach number"),
+    ("back-surface diffusion (DF)", "diffusion",
+     "diffusion factor DF = 1 - V/V_peak"),
     ("skin friction (Cf)", "cf", "skin friction coefficient |Cf|"),
     ("pressure coefficient (Cp)", "cp", "pressure coefficient Cp"),
     ("static pressure (p)", "p", "static pressure [Pa]"),
@@ -119,7 +122,8 @@ class SolutionTab(ttk.Frame):
         self.mode_var = tk.StringVar(value="contour")
         self.mode_box = ttk.Combobox(viewer_bar, textvariable=self.mode_var,
                                      state="readonly", width=10,
-                                     values=("contour", "1D surface"))
+                                     values=("contour", "1D surface",
+                                             "streamlines"))
         self.mode_box.pack(side="left")
         self.mode_box.bind("<<ComboboxSelected>>",
                            lambda _e: self._mode_changed())
@@ -130,6 +134,30 @@ class SolutionTab(ttk.Frame):
         self.field_box.pack(side="left")
         self.field_box.bind("<<ComboboxSelected>>",
                             lambda _e: self.draw_current())
+
+        # streamlines controls (shown only in streamlines view)
+        self.stream_ctl = []
+        self.stream_density_lbl = ttk.Label(viewer_bar, text="density:")
+        self.density_var = tk.StringVar(value="1.6")
+        self.stream_density_box = ttk.Combobox(
+            viewer_bar, textvariable=self.density_var, width=4,
+            values=("0.8", "1.2", "1.6", "2.0", "2.6", "3.2"))
+        self.stream_arrow_lbl = ttk.Label(viewer_bar, text="arrow size:")
+        self.arrow_var = tk.StringVar(value="1.0")
+        self.stream_arrow_box = ttk.Combobox(
+            viewer_bar, textvariable=self.arrow_var, width=4,
+            values=("0.7", "1.0", "1.4", "2.0"))
+        for w in (self.stream_density_lbl, self.stream_density_box,
+                  self.stream_arrow_lbl, self.stream_arrow_box):
+            w.pack(side="left", padx=(8, 0))
+            w.pack_forget()                      # revealed in streamlines view
+            self.stream_ctl.append(w)
+        for box in (self.stream_density_box, self.stream_arrow_box):
+            box.bind("<<ComboboxSelected>>", lambda _e: self.draw_current())
+            box.bind("<Return>", lambda _e: self.draw_current())
+            box.bind("<FocusOut>", lambda _e: self.draw_current()
+                     if self.mode_var.get() == "streamlines" else None)
+
         self.viewer_note = tk.Label(viewer_bar, text="", anchor="e",
                                     font=("TkDefaultFont", 8), fg="#595959")
         self.viewer_note.pack(side="right", padx=6)
@@ -169,7 +197,7 @@ class SolutionTab(ttk.Frame):
 
     # ------------------------------------------------------------ loading
     def reload_all(self):
-        self._pitch_cache = None
+        self._pitch_cache = None      # (mtime, pitch) tuple
         self._load_results(auto=True)
         self._load_case_volume()
         self._refresh_thumbnails()
@@ -251,7 +279,16 @@ class SolutionTab(ttk.Frame):
     # ------------------------------------------------------ quantity list
     def _mode_changed(self):
         self._sync_quantity_choices()
+        self._update_stream_controls()
         self.draw_current()
+
+    def _update_stream_controls(self):
+        show = self.mode_var.get() == "streamlines"
+        for w in self.stream_ctl:
+            if show:
+                w.pack(side="left", padx=(8, 0))
+            else:
+                w.pack_forget()
 
     def _sync_quantity_choices(self):
         """Fill the quantity dropdown for the active view mode."""
@@ -271,6 +308,8 @@ class SolutionTab(ttk.Frame):
             return
         if self.mode_var.get() == "1D surface":
             self.draw_surface()
+        elif self.mode_var.get() == "streamlines":
+            self.draw_streamlines()
         else:
             self.draw_field()
 
@@ -306,21 +345,29 @@ class SolutionTab(ttk.Frame):
         self.canvas.draw_idle()
 
     def _periodic_pitch(self):
-        """Spanwise pitch of the case (y translation), 0 when unknown."""
-        if getattr(self, "_pitch_cache", None) is not None:
-            return self._pitch_cache
-        pitch = 0.0
+        """Spanwise pitch of the case (y translation), 0 when unknown.
+
+        Cached per case.json mtime so a re-run with a different pitch is
+        picked up without a manual reload.
+        """
         case_path = self.app.state.case_dir() / "case.json"
-        if case_path.exists():
-            try:
-                case = json.loads(case_path.read_text())
-                pers = (case.get("cascade") or {}).get("periodic") or []
-                if pers:
-                    pitch = float(
-                        (pers[0].get("translation") or [0, 0, 0])[1] or 0.0)
-            except Exception:
-                pitch = 0.0
-        self._pitch_cache = pitch
+        try:
+            mtime = case_path.stat().st_mtime
+        except OSError:
+            return 0.0
+        cached = getattr(self, "_pitch_cache", None)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        pitch = 0.0
+        try:
+            case = json.loads(case_path.read_text())
+            pers = (case.get("cascade") or {}).get("periodic") or []
+            if pers:
+                pitch = float(
+                    (pers[0].get("translation") or [0, 0, 0])[1] or 0.0)
+        except Exception:
+            pitch = 0.0
+        self._pitch_cache = (mtime, pitch)
         return pitch
 
     def draw_surface(self):
@@ -394,6 +441,151 @@ class SolutionTab(ttk.Frame):
         self._surf_cache_for = self._volume
         self._surf_cache = dist
         return dist
+
+    def draw_streamlines(self):
+        """Velocity streamlines on a regular grid, drawn for the main
+        domain and both periodic copies, colored by the selected scalar
+        field. The blade interior is masked and the mesh domain edges +
+        blade outline are drawn as reference."""
+        d = self._volume
+        pts = d["points"]
+        if "Velocity" not in d:
+            self._enter_field_view()
+            self.ax.text(0.5, 0.5, "no velocity field in this volume",
+                         transform=self.ax.transAxes, ha="center",
+                         fontsize=9, color="0.4")
+            self.canvas.draw_idle()
+            return
+        vel = d["Velocity"][:, :2]
+        key = id(d)
+        if getattr(self, "_stream_key", None) != key:
+            x, y = pts[:, 0], pts[:, 1]
+            xg = np.linspace(x.min(), x.max(), 700)
+            yg = np.linspace(y.min(), y.max(), 500)
+            XX, YY = np.meshgrid(xg, yg)
+            _, conn = volume_triangulation(d)
+            from scipy.spatial import Delaunay
+            from scipy.interpolate import LinearNDInterpolator
+            tri = Delaunay(pts)
+            # no-slip inside the blade: zero velocity there so streamlines
+            # terminate on the surface instead of crossing it
+            from matplotlib.path import Path
+            v_ref = float(np.abs(vel).max()) or 1.0
+            loop = None
+            try:
+                loop = wall_points(pts, vel, v_ref)
+                inside = Path(np.vstack([loop, loop[0]])).contains_points(
+                    np.column_stack([XX.ravel(), YY.ravel()])
+                ).reshape(XX.shape)
+            except Exception:
+                loop, inside = None, None
+            u = LinearNDInterpolator(tri, vel[:, 0])(XX, YY)
+            v = LinearNDInterpolator(tri, vel[:, 1])(XX, YY)
+            if inside is not None:
+                u = np.where(inside, 0.0, np.nan_to_num(u))
+                v = np.where(inside, 0.0, np.nan_to_num(v))
+            # smooth away grid-scale interpolation noise - without this the
+            # streamlines jitter and appear to cross each other
+            from scipy.ndimage import gaussian_filter
+            sigma = 2.0
+            u_f = gaussian_filter(np.nan_to_num(u, nan=0.0), sigma)
+            v_f = gaussian_filter(np.nan_to_num(v, nan=0.0), sigma)
+            speed = np.hypot(u_f, v_f)
+            low = speed < 0.005 * max(speed.max(), 1e-12)
+            nan = np.isnan(u) | np.isnan(v)
+            u = np.ma.array(u_f, mask=(nan | low))
+            v = np.ma.array(v_f, mask=(nan | low))
+            self._stream_key = key
+            self._stream_grid = (XX, YY, u, v)
+            self._stream_loop = loop
+            self._stream_tri = tri
+            self._stream_colors = {}
+            self._edges_cache = None
+        XX, YY, u, v = self._stream_grid
+
+        # streamlines colored by the selected scalar (interpolated to the
+        # same grid)
+        name = self.field_var.get()
+        color = cmap = None
+        if name in self._fields:
+            values, cmap = self._fields[name]
+            ckey = (key, name)
+            self._stream_colors.setdefault(ckey, None)
+            if self._stream_colors[ckey] is None:
+                from scipy.interpolate import LinearNDInterpolator
+                c = LinearNDInterpolator(self._stream_tri, values)(XX, YY)
+                self._stream_colors[ckey] = np.ma.masked_invalid(c)
+            color = self._stream_colors[ckey]
+
+        try:
+            density = min(max(float(self.density_var.get()), 0.05), 10.0)
+        except (ValueError, tk.TclError):
+            density = 1.6
+        try:
+            arrowsize = min(max(float(self.arrow_var.get()), 0.2), 4.0)
+        except (ValueError, tk.TclError):
+            arrowsize = 1.0
+
+        pitch = self._periodic_pitch()
+        shifts = (-pitch, 0.0, pitch) if pitch else (0.0,)
+
+        self._enter_field_view()
+        ax = self.ax
+        for dy in shifts:
+            sp = dict(x=XX, y=YY + dy, u=u, v=v, density=density,
+                      linewidth=0.9, arrowsize=arrowsize, minlength=0.3)
+            if color is not None:
+                ax.streamplot(color=color, cmap=cmap, **sp)
+            else:
+                ax.streamplot(color="0.35", **sp)
+        ax.set_aspect("equal")
+
+        # reference: mesh periodic domain edges + blade outline
+        edges = self._domain_edges()
+        if edges:
+            for name_e, c in edges.items():
+                ax.plot(c[:, 0], c[:, 1], "--", color="0.35", lw=0.9,
+                        zorder=4,
+                        label="domain edges" if name_e == "periodic_bottom"
+                        else None)
+        loop = getattr(self, "_stream_loop", None)
+        if loop is not None:
+            closed = np.vstack([loop, loop[0]])
+            ax.plot(closed[:, 0], closed[:, 1], color="0.2", lw=1.2,
+                    zorder=5, label="airfoil")
+        ax.set_title("velocity streamlines", fontsize=10)
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        if edges or loop is not None:
+            ax.legend(fontsize=7, loc="upper right")
+        self.fig.tight_layout()
+        self.canvas.draw_idle()
+
+    def _domain_edges(self):
+        """Periodic domain edge polylines from the solver mesh (meters)."""
+        mesh_path = self.app.state.case_dir() / "mesh.su2"
+        if not mesh_path.exists():
+            return None
+        try:
+            stamp = (mesh_path, mesh_path.stat().st_mtime)
+        except OSError:
+            return None
+        cached = getattr(self, "_edges_cache", None)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        edges = {}
+        try:
+            from foilage_gui.su2_mesh import read_su2_mesh
+            m = read_su2_mesh(mesh_path)
+            for name in ("periodic_bottom", "periodic_top"):
+                if name in m["markers"]:
+                    e = m["markers"][name]
+                    coords = m["points"][e[:, 0]]      # first node per edge
+                    edges[name] = coords[np.argsort(coords[:, 0])]
+        except Exception:
+            edges = {}
+        self._edges_cache = (stamp, edges)
+        return edges
 
     def import_vtk(self):
         case_dir = self.app.state.case_dir()
@@ -503,6 +695,12 @@ class SolutionTab(ttk.Frame):
             lines.append("")
             lines.append(f"total-pressure loss Yp : "
                          f"{r['losses'].get('total_pressure_loss_coeff_Yp', 0):.4f}")
+        bsd = r.get("back_surface_diffusion")
+        if bsd:
+            ss_df = bsd.get("ss", {}).get("DF", 0)
+            ps_df = bsd.get("ps", {}).get("DF", 0)
+            lines.append(f"back-surface DF (TE)   : ss {ss_df:.3f}   "
+                         f"ps {ps_df:.3f}")
         if "mass_balance" in r:
             lines.append(f"mass-flow imbalance    : "
                          f"{r['mass_balance'].get('imbalance_pct', 0):.3f} %")

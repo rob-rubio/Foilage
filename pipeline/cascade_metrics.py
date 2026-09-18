@@ -10,16 +10,18 @@ import math
 import numpy as np
 
 
-def channel_widths(ss, ps, pitch):
+def channel_widths(ss, ps, pitch, ss_upper):
     """Width of the blade-to-blade channel.
 
-    The passage between the blade and the neighbor at +pitch is bounded
-    by this blade's suction side (below) and the neighbor's pressure side
-    (above). For every suction-side point, the distance to the nearest
-    point of that neighbor pressure side. Returns (s_min per SS point,
-    index into ps of the nearest point).
+    The passage adjacent to the suction side is bounded by that surface
+    and the neighboring blade's pressure side: the neighbor sits at
+    +pitch for CAP blades (suction side up) and at -pitch for CUP blades
+    (suction side down). For every suction-side point, the distance to
+    the nearest point of that neighbor pressure side. Returns (s_min per
+    SS point, index into ps of the nearest point).
     """
-    nb_ps = np.asarray(ps) + np.array([0.0, float(pitch)])
+    sgn = 1.0 if ss_upper else -1.0
+    nb_ps = np.asarray(ps) + np.array([0.0, sgn * float(pitch)])
     d = np.linalg.norm(ss[:, None, :] - nb_ps[None, :, :], axis=2)
     j = np.argmin(d, axis=1)
     return d[np.arange(len(ss)), j], j
@@ -53,14 +55,14 @@ def _exit_angle(xy, u0=0.85, u1=0.95, half=3):
     return float(np.degrees(np.arctan2(vy, vx)))
 
 
-def throat_metrics(ss, ps, pitch, half=4):
+def throat_metrics(ss, ps, pitch, ss_upper, half=4):
     """Throat and unguided-turning metrics, measured on the suction side
     (the surface guiding the flow through the throat).
 
     Unguided turning is the metal-angle change from the throat to the
     trailing edge: alpha_throat - alpha_exit.
     """
-    s_ch, _j = channel_widths(ss, ps, pitch)
+    s_ch, _j = channel_widths(ss, ps, pitch, ss_upper)
     ki = int(np.argmin(s_ch))
     width = float(s_ch[ki])
 

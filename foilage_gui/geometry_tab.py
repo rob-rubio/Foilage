@@ -56,8 +56,8 @@ def _compute_geometry(cfg):
 
         # ---- channel + throat (blade vs pitch-translated neighbor) ----
         pitch = float(prof["p_le"])         # R1 == R2 for SU2 periodicity
-        s_ch, _j = channel_widths(ss, ps, pitch)
-        throat = throat_metrics(ss, ps, pitch)
+        s_ch, _j = channel_widths(ss, ps, pitch, airfoil["ss_upper"])
+        throat = throat_metrics(ss, ps, pitch, airfoil["ss_upper"])
 
         # ---- surface curvature ----
         k_ss, _s_ss = curvature(ss)
@@ -121,6 +121,7 @@ class GeometryTab(ttk.Frame):
         self._dirty_while_busy = False
         self._results = queue.Queue()
         self._last_good = None
+        self._ac_before_infer = None   # pyturbo axial chord, remembered
 
         pane = ttk.PanedWindow(self, orient="horizontal")
         pane.pack(fill="both", expand=True)
@@ -186,6 +187,7 @@ class GeometryTab(ttk.Frame):
 
         self.reload_fields()
         self._refresh_sections(commit=False)
+        self._infer_from_geomturbo()
         self.schedule_regeneration(immediate=True)
 
     # ------------------------------------------------------------- fields
@@ -193,9 +195,72 @@ class GeometryTab(ttk.Frame):
         self.app.state.set(spec.path, value)
         if spec.path == "airfoil_source.geomturbo_file":
             self._refresh_sections(commit=True)
+            self._infer_from_geomturbo()
+        elif spec.path == "airfoil_source.type":
+            self._refresh_sections(commit=False)
+            if value == "geomturbo":
+                self._infer_from_geomturbo()
+            elif value == "pyturbo" and self._ac_before_infer is not None:
+                # switching back to the generator: restore its own axial
+                # chord (the geomTurbo-inferred value would wreck the
+                # pyturbo thickness proportions)
+                self.app.state.set("airfoil.axial_chord",
+                                   self._ac_before_infer)
+                self._ac_before_infer = None
+                self.reload_fields()
+        elif spec.path == "airfoil_source.section":
+            self._infer_from_geomturbo()
         elif spec.path == "airfoil_source.show_reference":
             if self._last_good:                     # overlay-only change
                 self._draw(self._last_good)
+
+    def _infer_from_geomturbo(self):
+        """Populate axial chord / blade count / R1 / R2 from the imported
+        geomTurbo (only while the geomTurbo source is active).
+
+        Inferred values are converted from file units into the units the
+        case currently uses (mm when axial_chord >= 1, else meters). The
+        previous axial chord is remembered so switching back to pyturbo
+        can restore it.
+        """
+        if self.app.state.get("airfoil_source.type") != "geomturbo":
+            return
+        path = self.app.state.get("airfoil_source.geomturbo_file")
+        if not path:
+            return
+        try:
+            from pipeline.geomturbo import (infer_cascade_parameters,
+                                            parse_geomturbo)
+            parsed = parse_geomturbo(path)
+            inf = infer_cascade_parameters(
+                parsed, self.app.state.get("airfoil_source.section") or 0)
+        except Exception as e:
+            self.status_var.set(f"geomTurbo inference failed: {e}")
+            return
+        if not inf:
+            return
+        cur_ac = float(self.app.state.get("airfoil.axial_chord") or 1.0)
+        # file units -> the case's current mm/m convention
+        to_current = (1000.0 if cur_ac >= 1.0 else 1.0) \
+            * (parsed.get("units") or 1.0)
+        if self._ac_before_infer is None:
+            self._ac_before_infer = cur_ac     # remember the generator value
+        updates = [("airfoil.axial_chord", inf["axial_chord"] * to_current),
+                   ("domain.airfoil_count", inf["blade_count"])]
+        if inf["R1"] is not None:
+            updates.append(("domain.R1", inf["R1"] * to_current))
+        if inf["R2"] is not None:
+            updates.append(("domain.R2", inf["R2"] * to_current))
+        applied = []
+        for path_key, value in updates:
+            if value is not None and self.app.state.set(path_key, value):
+                applied.append(f"{path_key.split('.')[-1]} = {value:.6g}")
+        self.reload_fields()                   # sync every panel display
+        if applied:
+            self.status_var.set("inferred from geomTurbo: "
+                                + ", ".join(applied))
+        else:
+            self.status_var.set("geomTurbo parameters already up to date")
 
     def _export_geomturbo(self):
         """Save the active blade section (SS/PS) as a .geomTurbo file.

@@ -175,14 +175,17 @@ class CaseState:
         p2 = self.get("BCs.outlet.static pressure")
         r1, n = self.get("domain.R1"), self.get("domain.airfoil_count")
         scale = self.scale_m_per_chord()
+        ac = float(self.get("airfoil.axial_chord") or 1.0)
         d["scale_m"] = scale
         gamma, gamma_src = self.effective_gamma()
         d["gamma_eff"] = gamma
         d["gamma_source"] = gamma_src
+        units_to_m = 0.001 if (ac or 0.0) >= 1.0 else 1.0
         if r1 and n:
-            d["pitch_le_m"] = 2.0 * math.pi * r1 / n * scale
+            d["pitch_le_m"] = 2.0 * math.pi * r1 * units_to_m / n
         if r1 and n and self.get("domain.R2"):
-            d["pitch_te_m"] = 2.0 * math.pi * float(self.get("domain.R2")) / n * scale
+            d["pitch_te_m"] = 2.0 * math.pi * float(self.get("domain.R2")) \
+                * units_to_m / n
         if None not in (p01, T01, p2) and p01 and p2 and p2 < p01:
             g = gamma
             T2 = T01 * (p2 / p01) ** ((g - 1) / g)

@@ -266,7 +266,9 @@ def main():
     if abs(dom["R1"] - dom["R2"]) > 1e-9 * max(dom["R1"], dom["R2"], 1.0):
         sys.exit("R1 != R2 (varying pitch) cannot be paired by SU2 - "
                  "regenerate the mesh with R1 = R2 (see the_process.md)")
-    pitch_m = 2.0 * math.pi * dom["R1"] / dom["airfoil_count"] * scale
+    # R1/R2 are actual radii (same units as axial_chord): convert to meters
+    units_to_m = 0.001 if ac >= 1.0 else 1.0
+    pitch_m = 2.0 * math.pi * dom["R1"] * units_to_m / dom["airfoil_count"]
 
     # ---- BCs from input.json
     p01, T01, ang, p2 = load_bc(cfg)

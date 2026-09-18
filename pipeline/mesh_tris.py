@@ -27,10 +27,22 @@ NSEG_PERIODIC = 60  # transfinite segments per periodic edge
 
 
 def pitch_profile(dom_cfg, airfoil):
-    """Pitch p(x) and blade centerline y_c(x); p fixed fore of LE / aft of TE."""
+    """Pitch p(x) and blade centerline y_c(x); p fixed fore of LE / aft of TE.
+
+    ``domain.R1`` / ``domain.R2`` are the annulus radii at the LE/TE in
+    *actual units* (the same units as ``airfoil.axial_chord``, e.g. mm).
+    They are normalized by the axial chord here so the passage is built in
+    normalized coordinates (blade axial chord = 1).
+    """
     N = float(dom_cfg["airfoil_count"])
-    p_le = 2.0 * np.pi * dom_cfg["R1"] / N
-    p_te = 2.0 * np.pi * dom_cfg["R2"] / N
+    ac = float(airfoil.get("axial_chord") or 0.0)
+    r1 = float(dom_cfg["R1"])
+    r2 = float(dom_cfg["R2"])
+    if ac > 0:                       # actual units -> normalized
+        r1 /= ac
+        r2 /= ac
+    p_le = 2.0 * np.pi * r1 / N
+    p_te = 2.0 * np.pi * r2 / N
 
     ss, ps = airfoil["ss"], airfoil["ps"]
     x_le = float(min(ss[0, 0], ps[0, 0]))
