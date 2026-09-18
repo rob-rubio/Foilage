@@ -30,14 +30,16 @@ def build_geometry(cfg):
     if not file_path:
         raise ValueError("geomTurbo source selected but "
                          "airfoil_source.geomturbo_file is empty")
-    sections = parse_geomturbo(file_path)
+    parsed = parse_geomturbo(file_path)
+    sections = parsed["sections"]
     idx = int(src.get("section") or 0)
     idx = max(0, min(idx, len(sections) - 1))
     sec = sections[idx]
     n = int(cfg.get("airfoil", {}).get("n_points", 401))
-    af = section_to_airfoil(sec["points"], n_points=n)
+    af = section_to_airfoil(sec, n_points=n)
     af["airfoil2d"] = None
     af["section_z"] = sec["z"]
+    af["blade_count"] = parsed["blade_count"]
     return af
 
 

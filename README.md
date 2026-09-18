@@ -279,6 +279,6 @@ Gmsh, PyTurbo-Aero, NumPy, SciPy, Matplotlib, and SU2 remain under their own lic
 
 ### `.geomTurbo` interoperability
 
-Foilage provides independent interoperability with a limited point-based subset of the `.geomTurbo` format: it can read blade-section point data and export an airfoil as point data.
+Foilage provides independent interoperability with a limited point-based subset of the `.geomTurbo` format. Native files are read from their `suction` and `pressure` `SECTIONAL` blocks; the parser returns the periodic blade count plus each section's SS and PS point arrays, and the GUI can select a section for meshing. Export writes the same native point-block structure. Coordinates are normalized internally to canonical X/Y/Z order, while NUMECA's file-order Z/Y/X rows are handled at the format boundary.
 
 NUMECA, AutoGrid, and `.geomTurbo` are trademarks or proprietary technology of their respective owners. Foilage is not affiliated with, endorsed by, or sponsored by NUMECA or Cadence. No NUMECA software, documentation, or sample geometry files are distributed with Foilage.

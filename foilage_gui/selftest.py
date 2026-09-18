@@ -112,19 +112,36 @@ def test_geomturbo_import():
                      .read_text())
     ref = build_airfoil(cfg["airfoil"])
 
-    # synthesize a geomTurbo file from the reference blade: the polyline
-    # runs TE -> PS -> LE -> SS -> TE in machine coordinates (x axial)
+    # Exercise the native NUMECA layout: separate SECTIONAL suction and
+    # pressure blocks, two spanwise sections, and file-order Z Y X rows.
     ss, ps = ref["ss"], ref["ps"]
-    pts = np.vstack([ps[::-1], ss[1:]])
     with tempfile.TemporaryDirectory() as tmp:
         gt = Path(tmp) / "test.geomTurbo"
-        lines = ["================= GLOBAL =================", "UNITS= m",
-                 "================= BLADE =================", "NK= 1",
-                 "BEGINBLADE", "BEGINSECTION Z= 0.025",
-                 f"NUMBEROFPOINTSNUMBEROFPOINTS= {len(pts)}"]
-        lines += [f"{x:.9f} {y:.9f} 0.0" for x, y in pts]
-        lines += ["ENDSECTION", "ENDBLADE"]
+        scale = 0.105
+        lines = [
+            "TYPE GEOMTURBO", "GEOMETRY TURBO VERSION 5", "units 1",
+            "NI_BEGIN nibladegeometry", "number_of_blades 20",
+            "suction", "SECTIONAL", "2",
+        ]
+        for section_z in (0.0, 0.025):
+            lines += [f"# SECTION {1 if section_z == 0.0 else 2}",
+                      "XYZ", str(len(ss))]
+            lines += [f"{section_z:.9f} {y * scale:.9f} {x * scale:.9f}"
+                      for x, y in ss]
+        lines += ["pressure", "SECTIONAL", "2"]
+        for section_z in (0.0, 0.025):
+            lines += [f"# SECTION {1 if section_z == 0.0 else 2}",
+                      "XYZ", str(len(ps))]
+            lines += [f"{section_z:.9f} {y * scale:.9f} {x * scale:.9f}"
+                      for x, y in ps]
+        lines += ["NI_END nibladegeometry"]
         gt.write_text("\n".join(lines))
+
+        parsed = parse_geomturbo(gt)
+        assert parsed["blade_count"] == 20
+        assert len(parsed["sections"]) == 2
+        assert parsed["sections"][0]["ss"].shape == (len(ss), 3)
+        assert parsed["sections"][0]["ps"].shape == (len(ps), 3)
 
         cfg["airfoil_source"] = {"type": "geomturbo", "geomturbo_file": str(gt),
                                  "section": 0}
@@ -163,7 +180,7 @@ def test_geomturbo_import():
     with tempfile.TemporaryDirectory() as tmp2:
         export = Path(tmp2) / "export.geomTurbo"
         write_geomturbo(export, ref["ss"] * 0.105, ref["ps"] * 0.105, z=0.0)
-        back = section_to_airfoil(parse_geomturbo(export)[0]["points"],
+        back = section_to_airfoil(parse_geomturbo(export)["sections"][0],
                                   n_points=len(ref["ss"]))
     assert len(back["ss"]) == len(ref["ss"])
     # the import normalization anchors at the LE and the suction-side

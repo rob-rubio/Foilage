@@ -75,11 +75,12 @@ def _compute_geometry(cfg):
                 from pipeline.geomturbo import (parse_geomturbo,
                                                 section_to_airfoil)
                 gt_path = Path(src["geomturbo_file"])
-                secs = parse_geomturbo(gt_path)
+                parsed = parse_geomturbo(gt_path)
+                secs = parsed["sections"]
                 idx = int(src.get("section") or 0)
                 sec = secs[max(0, min(idx, len(secs) - 1))]
                 n_ref = int(cfg.get("airfoil", {}).get("n_points", 401))
-                ref_af = section_to_airfoil(sec["points"], n_points=n_ref)
+                ref_af = section_to_airfoil(sec, n_points=n_ref)
                 import_pts = (ref_af["ss"], ref_af["ps"])
                 import_mtime = gt_path.stat().st_mtime
             except Exception as e:
@@ -97,6 +98,7 @@ def _compute_geometry(cfg):
             else None,
             "p_le": prof["p_le"], "p_te": prof["p_te"],
             "source": src.get("type", "pyturbo"),
+            "blade_count": airfoil.get("blade_count"),
             "import_pts": import_pts,
             "import_err": ref_err,
             "import_mtime": import_mtime,
@@ -235,7 +237,8 @@ class GeometryTab(ttk.Frame):
         if path:
             try:
                 from pipeline.geomturbo import parse_geomturbo
-                secs = parse_geomturbo(path)
+                parsed = parse_geomturbo(path)
+                secs = parsed["sections"]
                 pairs = [(f"Z = {s['z']:g}  [#{i}]", i)
                          for i, s in enumerate(secs)]
             except Exception as e:
@@ -314,6 +317,8 @@ class GeometryTab(ttk.Frame):
             parts.append(f"turning {g['turning']:.1f} deg")
         parts.append(f"pitch LE {g['p_le']:.4f}, TE {g['p_te']:.4f}")
         parts.append(f"{g['n_points']} points/side")
+        if g.get("blade_count") is not None:
+            parts.append(f"{g['blade_count']} blades")
         if g["import_err"]:
             parts.append(f"geomTurbo reference failed ({g['import_err']})")
         return "  |  ".join(parts)
