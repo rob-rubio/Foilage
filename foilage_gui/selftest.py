@@ -8,6 +8,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
+
 REPO = Path(__file__).resolve().parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
@@ -95,6 +97,85 @@ def test_gamma_model():
     print(f"gamma OK (auto {g:.4f} @ {T01:g} K; explicit 1.35 overrides)")
 
 
+def test_geomturbo_import():
+    import copy
+    import tempfile
+    if str(REPO / "pipeline") not in sys.path:
+        sys.path.insert(0, str(REPO / "pipeline"))
+    from pipeline.airfoil import build_airfoil, build_geometry
+    from pipeline.cascade_metrics import channel_widths, curvature, \
+        throat_metrics
+    from pipeline.geomturbo import (parse_geomturbo, section_to_airfoil,
+                                    write_geomturbo)
+
+    cfg = json.loads((REPO / "cases" / "turbine_blade_9" / "input.json")
+                     .read_text())
+    ref = build_airfoil(cfg["airfoil"])
+
+    # synthesize a geomTurbo file from the reference blade: the polyline
+    # runs TE -> PS -> LE -> SS -> TE in machine coordinates (x axial)
+    ss, ps = ref["ss"], ref["ps"]
+    pts = np.vstack([ps[::-1], ss[1:]])
+    with tempfile.TemporaryDirectory() as tmp:
+        gt = Path(tmp) / "test.geomTurbo"
+        lines = ["================= GLOBAL =================", "UNITS= m",
+                 "================= BLADE =================", "NK= 1",
+                 "BEGINBLADE", "BEGINSECTION Z= 0.025",
+                 f"NUMBEROFPOINTSNUMBEROFPOINTS= {len(pts)}"]
+        lines += [f"{x:.9f} {y:.9f} 0.0" for x, y in pts]
+        lines += ["ENDSECTION", "ENDBLADE"]
+        gt.write_text("\n".join(lines))
+
+        cfg["airfoil_source"] = {"type": "geomturbo", "geomturbo_file": str(gt),
+                                 "section": 0}
+        af = build_geometry(cfg)
+    n = int(cfg["airfoil"]["n_points"])
+    assert len(af["ss"]) in (n, n + 1), f"ss points {len(af['ss'])}"
+    xmin = min(af["ss"][:, 0].min(), af["ps"][:, 0].min())
+    xmax = max(af["ss"][:, 0].max(), af["ps"][:, 0].max())
+    assert abs(xmin) < 1e-9 and 0.98 <= xmax <= 1.1, \
+        f"normalization wrong (x range {xmin}, {xmax})"
+    # roundtrip fidelity: suction side stays the suction side (same mean-y
+    # ordering relative to ps as the reference)
+    assert (af["ss"][:, 1].mean() > af["ps"][:, 1].mean()) == \
+           (ref["ss"][:, 1].mean() > ref["ps"][:, 1].mean())
+    assert af["style"] == "geomTurbo import"
+
+    # channel/throat/curvature sanity on the reference blade at a
+    # realistic pitch (blade_9's own pitch is very coarse, s/c = 1.26,
+    # which degenerates the throat toward the TE tail)
+    cfg["domain"]["R1"] = cfg["domain"]["R2"] = 7.0
+    cfg["domain"]["airfoil_count"] = 90          # s/c ~ 0.49
+    from pipeline.mesh_tris import pitch_profile
+    prof = pitch_profile(cfg["domain"], ref)
+    s_ch, _j = channel_widths(ref["ss"], ref["ps"], prof["p_le"])
+    assert 0.05 < s_ch.min() < prof["p_le"], "throat width out of range"
+    t = throat_metrics(ref["ss"], ref["ps"], prof["p_le"])
+    assert 0.1 < t["x_over_cax"] < 0.95
+    assert 0.0 < t["unguided_turning_deg"] < 45.0
+    assert t["width"] > 0
+    k_ss, _ = curvature(ref["ss"])
+    assert np.isfinite(k_ss).all() and k_ss.max() > k_ss.min()
+
+    # geomTurbo export -> import roundtrip (export is in meters; the
+    # import re-normalizes to axial chord = 1)
+    from pipeline.geomturbo import write_geomturbo
+    with tempfile.TemporaryDirectory() as tmp2:
+        export = Path(tmp2) / "export.geomTurbo"
+        write_geomturbo(export, ref["ss"] * 0.105, ref["ps"] * 0.105, z=0.0)
+        back = section_to_airfoil(parse_geomturbo(export)[0]["points"],
+                                  n_points=len(ref["ss"]))
+    assert len(back["ss"]) == len(ref["ss"])
+    # the import normalization anchors at the LE and the suction-side
+    # trailing point - pyturbo's axial-chord parameter differs from that
+    # geometric distance by ~1%, so sub-1.5% tail deviation is expected
+    dev = np.abs(back["ss"] - ref["ss"]).max()
+    assert dev < 1.5e-2, f"export/import ss deviation {dev:.5f} too large"
+    print(f"geomTurbo import OK (roundtrip {len(af['ss'])} pts; throat "
+          f"{s_ch.min():.4f} c_ax, unguided {t['unguided_turning_deg']:.1f} deg; "
+          f"export deviation {dev:.2e})")
+
+
 def test_su2_mesh_reader():
     meshes = sorted((REPO / "cases").glob("*/*/mesh*.su2")) + \
         sorted((REPO / "cases").glob("*/mesh*.su2"))
@@ -143,6 +224,7 @@ def main():
     test_validation()
     test_derived()
     test_gamma_model()
+    test_geomturbo_import()
     test_su2_mesh_reader()
     test_postproc_integration()
     print("selftest OK")

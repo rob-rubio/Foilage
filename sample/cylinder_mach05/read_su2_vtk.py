@@ -11,15 +11,6 @@ GAMMA = 1.4
 R_AIR = 287.058
 
 
-def _as_float64(values):
-    """Convert a candidate field without warning on invalid endian probes."""
-    # read_legacy_vtk tries both byte orders.  The rejected interpretation can
-    # contain signaling NaNs, which NumPy warns about while casting even
-    # though that candidate is discarded by the plausibility checks.
-    with np.errstate(invalid="ignore"):
-        return values.astype(np.float64)
-
-
 def _scan(path, dtype):
     """Single pass over the file with a given float dtype."""
     data = {"dtype": dtype}
@@ -34,9 +25,7 @@ def _scan(path, dtype):
             s = line.decode("ascii").strip()
             if s.startswith("POINTS"):
                 n = int(s.split()[1])
-                data["points"] = _as_float64(
-                    np.frombuffer(f.read(3 * n * 4), dtype=dtype)
-                    .reshape(n, 3)[:, :2])
+                data["points"] = np.frombuffer(f.read(3 * n * 4), dtype=dtype).reshape(n, 3)[:, :2].astype(np.float64)
             elif s.startswith("CELLS"):
                 n, size = int(s.split()[1]), int(s.split()[2])
                 buf = np.frombuffer(f.read(size * 4), dtype=np.dtype(">i4" if dtype.byteorder == ">" else "<i4"))
@@ -56,16 +45,11 @@ def _scan(path, dtype):
             elif s.startswith("SCALARS"):
                 name, ncomp = s.split()[1], int(s.split()[3])
                 f.readline()  # LOOKUP_TABLE
-                data[name] = _as_float64(
-                    np.frombuffer(
-                        f.read(len(data["points"]) * ncomp * 4), dtype=dtype)
-                    .reshape(-1, ncomp))
+                data[name] = np.frombuffer(f.read(len(data["points"]) * ncomp * 4), dtype=dtype).reshape(-1, ncomp).astype(np.float64)
             elif s.startswith("VECTORS"):
                 name = s.split()[1]
                 n = len(data["points"])
-                data[name] = _as_float64(
-                    np.frombuffer(f.read(n * 3 * 4), dtype=dtype)
-                    .reshape(n, 3))
+                data[name] = np.frombuffer(f.read(n * 3 * 4), dtype=dtype).reshape(n, 3).astype(np.float64)
     return data
 
 

@@ -35,6 +35,18 @@ The local `SU2-v8.5.0-win64-omp/` directory is ignored by Git and is retained
 only as a developer-local installation. It must not be treated as part of the
 Foilage GPL-covered source tree.
 
+## `.geomTurbo` interoperability
+
+Foilage includes an independently written reader and writer for a limited,
+point-based subset of the `.geomTurbo` format. This is an interoperability
+feature, not a distribution of NUMECA software, documentation, or sample
+geometry files.
+
+NUMECA, AutoGrid, and `.geomTurbo` are trademarks or proprietary technology
+of their respective owners. Foilage is not affiliated with, endorsed by, or
+sponsored by NUMECA or Cadence. This notice does not claim or grant any
+license to NUMECA or Cadence intellectual property.
+
 ## Important redistribution note
 
 If a future release bundles Gmsh, PyTurbo-Aero, SU2, or their binaries, update

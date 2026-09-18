@@ -8,6 +8,7 @@ red instead of silently accepting them.
 
 import math
 import tkinter as tk
+from pathlib import Path
 from tkinter import ttk
 
 from .schema import FieldSpec
@@ -130,6 +131,7 @@ class FieldWidget:
             "float": self._build_numeric,
             "int": self._build_numeric,
             "str": self._build_str,
+            "file": self._build_file,
             "bool": self._build_bool,
             "choice": self._build_choice,
             "float_array": self._build_array,
@@ -137,6 +139,28 @@ class FieldWidget:
             "nullable_int": self._build_nullable,
         }[spec.kind]
         builder()
+
+    def _build_file(self):
+        """String entry + Browse button (path stored as text)."""
+        self._build_str()
+        self.entry.configure(width=30)
+        ttk.Button(self.frame, text="...", width=3,
+                   command=self._browse, takefocus=0).pack(side="left",
+                                                           padx=(4, 0))
+
+    def _browse(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Select geometry file",
+            initialdir=str(Path(self.var.get()).parent)
+            if self.var.get() and Path(self.var.get()).parent.exists()
+            else str(Path.home()),
+            filetypes=[("geomTurbo", "*.geomTurbo *.gturb"),
+                       ("Point files", "*.txt *.dat *.dat.asc"),
+                       ("All files", "*.*")])
+        if path:
+            self.var.set(path)
+            self._entry_commit()
 
     # ------------------------------------------------------------ editors
     def _build_numeric(self):
@@ -222,7 +246,14 @@ class FieldWidget:
             if spec.kind == "bool":
                 return True, bool(self.var.get())
             if spec.kind == "choice":
-                return True, self._by_label[self.var.get()]
+                text = self.var.get()
+                if text in self._by_label:
+                    return True, self._by_label[text]
+                # dropdown cleared/empty: fall back to the stored value
+                if self._last_committed is not None:
+                    return True, self._last_committed
+                return False, (f"{spec.label}: choose a value from the "
+                               "dropdown")
             if spec.kind == "float_array":
                 vals = [parse_float(e.get()) for e in self._entries]
                 return True, vals
@@ -233,7 +264,7 @@ class FieldWidget:
                     return True, parse_int(self.var.get())
                 return True, parse_float(self.var.get())
             text = self.var.get()
-            if spec.kind == "str":
+            if spec.kind in ("str", "file"):
                 return True, text
             if spec.kind == "int":
                 v = parse_int(text)
@@ -247,6 +278,21 @@ class FieldWidget:
         except (ValueError, KeyError) as e:
             return False, str(e)
 
+    def set_choices(self, pairs):
+        """Replace the option list of a choice widget at runtime
+        (pairs of (label, stored value)). An empty list is a no-op: the
+        current selection stays usable (e.g. "Section" when no geomTurbo
+        file is loaded)."""
+        if not pairs:
+            return
+        self._labels = [lbl for lbl, _v in pairs]
+        self._by_label = dict(pairs)
+        if hasattr(self, "entry") and self.entry is not None:
+            self.entry.configure(values=self._labels)
+        if self.var.get() not in self._labels:
+            self.var.set(self._labels[0])
+            self._last_committed = self._by_label.get(self.var.get())
+
     def set_value(self, value):
         """Push a programmatic value into the editor (no commit)."""
         spec = self.spec
@@ -256,7 +302,7 @@ class FieldWidget:
             if spec.kind == "bool":
                 self.var.set(bool(value))
             elif spec.kind == "choice":
-                for lbl, v in spec.choices:
+                for lbl, v in self._by_label.items():
                     if v == value:
                         self.var.set(lbl)
                         break

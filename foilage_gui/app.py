@@ -14,6 +14,7 @@ from foilage_gui.state import CaseState  # noqa: E402
 from foilage_gui.runner import build_job  # noqa: E402
 
 POLL_MS = 120
+REPO = Path(__file__).resolve().parent.parent
 
 
 class FoilageApp:
@@ -29,6 +30,7 @@ class FoilageApp:
         root.title("Foilage - 2D CFD pipeline")
         root.geometry("1280x860")
         root.minsize(1024, 680)
+        self._set_app_icon()
         self._build_toolbar()
 
         self.notebook = ttk.Notebook(root)
@@ -50,6 +52,17 @@ class FoilageApp:
 
         self.root.after(POLL_MS, self._pump)
         self._update_title()
+
+    # ------------------------------------------------------------- brand
+    def _set_app_icon(self):
+        icon = REPO / "resources" / "Foilage_Icon.png"
+        if not icon.exists():
+            return
+        try:
+            self._icon_image = tk.PhotoImage(file=str(icon))
+            self.root.iconphoto(True, self._icon_image)
+        except Exception:
+            pass                        # cosmetic only
 
     # ------------------------------------------------------------ toolbar
     def _build_toolbar(self):
@@ -153,7 +166,8 @@ class FoilageApp:
             messagebox.showerror(
                 "Cannot start",
                 "Fix the following problems first:\n\n"
-                + "\n".join(f"- {m}" for _s, m in issues[:10]))
+                + "\n".join(f"- {m or '(no details)'}"
+                            for _s, m in issues[:10]))
             return
 
         su2_needed = mode in ("full", "setup", "solve")
@@ -183,7 +197,18 @@ class FoilageApp:
 
         case_dir = self.state.case_dir()
         case_dir.mkdir(parents=True, exist_ok=True)
+        if mode in ("full", "solve") and self.state.get(
+                "solver_settings.restart"):
+            if not (case_dir / "restart.dat").exists():
+                messagebox.showerror(
+                    "No restart file",
+                    f"Initialize-from-solution is enabled, but "
+                    f"{case_dir / 'restart.dat'} does not exist.\n"
+                    "The restart file is written by every solve - run the "
+                    "case once (with the option off) before warm-starting.")
+                return
         self.job = build_job(self.state, mode, self.threads, su2_exe)
+        self.job.restart = bool(self.state.get("solver_settings.restart"))
         self.job.start()
         for tab in self._tabs:
             if hasattr(tab, "_update_buttons"):

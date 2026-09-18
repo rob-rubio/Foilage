@@ -22,7 +22,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from airfoil import build_airfoil
+from airfoil import build_geometry
 from mesh_tris import mesh_domain, pitch_profile
 from plots import plot_airfoil, plot_tri_mesh, plot_quad_mesh
 import quadify
@@ -125,8 +125,9 @@ def main():
 
     t_all = time.time()
 
-    print("[1/5] airfoil (pyturbo-aero, left_to_right=True) ...")
-    airfoil = build_airfoil(cfg["airfoil"])
+    src = (cfg.get("airfoil_source") or {}).get("type", "pyturbo")
+    print(f"[1/5] airfoil (source: {src}) ...")
+    airfoil = build_geometry(cfg)
     plot_airfoil(airfoil, case_dir / "airfoil_geometry.png")
     print(
         f"      outline points: {len(airfoil['outline'])}, "

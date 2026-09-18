@@ -37,6 +37,8 @@ from su2_vtk import read_legacy_vtk                    # noqa: E402
 from plot_case import (fields_from_volume,             # noqa: E402
                        surface_distributions, volume_triangulation)
 
+from .widgets import Tooltip                           # noqa: E402
+
 RESULTS_POLL_MS = 1500
 LIVE_POLL_MS = 600
 
@@ -77,10 +79,20 @@ class SolutionTab(ttk.Frame):
                                              "after a run")
         tk.Label(bar, textvariable=self.status_var, anchor="w",
                  font=("TkDefaultFont", 8, "bold")).pack(side="left")
+        self.run_btn = tk.Button(bar, text="Start run", state="disabled",
+                                 command=lambda: app.run_job("solve"),
+                                 bg="#dff0d8")
+        self.run_btn.pack(side="right", padx=2)
+        Tooltip(self.run_btn, "Solve only: run SU2 on the prepared "
+                              "turbine.cfg (skips meshing/case setup).")
+        self.stop_btn = tk.Button(bar, text="Stop run", state="disabled",
+                                  command=app.stop_job, fg="#a00")
+        self.stop_btn.pack(side="right", padx=2)
         ttk.Button(bar, text="Reload", width=8, command=self.reload_all
                    ).pack(side="right", padx=2)
         ttk.Button(bar, text="Import .vtk ...", command=self.import_vtk
                    ).pack(side="right", padx=2)
+        self._update_buttons()
 
         pane = ttk.PanedWindow(self, orient="horizontal")
         pane.pack(fill="both", expand=True)
@@ -157,6 +169,7 @@ class SolutionTab(ttk.Frame):
 
     # ------------------------------------------------------------ loading
     def reload_all(self):
+        self._pitch_cache = None
         self._load_results(auto=True)
         self._load_case_volume()
         self._refresh_thumbnails()
@@ -268,21 +281,47 @@ class SolutionTab(ttk.Frame):
             return
         values, cmap = self._fields[name]
         pts, conn = volume_triangulation(self._volume)
+        pitch = self._periodic_pitch()
+        shifts = (-pitch, 0.0, pitch) if pitch else (0.0,)
         # full rebuild: guarantees the field owns the whole canvas and no
         # live-convergence axes or stale colorbars survive
         self._enter_field_view()
         ax = self.ax
-        tc = ax.tricontourf(pts[:, 0], pts[:, 1], conn, values,
-                            levels=40, cmap=cmap)
+        tc = None
+        for dy in shifts:
+            tc = ax.tricontourf(pts[:, 0], pts[:, 1] + dy, conn, values,
+                                levels=40, cmap=cmap)
         ax.set_aspect("equal")
         ax.set_xlim(pts[:, 0].min(), pts[:, 0].max())
-        ax.set_ylim(pts[:, 1].min(), pts[:, 1].max())
+        ymin, ymax = pts[:, 1].min(), pts[:, 1].max()
+        if pitch:
+            ymin -= 0.45 * pitch
+            ymax += 0.45 * pitch
+        ax.set_ylim(ymin, ymax)
         ax.set_title(name, fontsize=10)
         ax.set_xlabel("x")
         ax.set_ylabel("y")
         self.fig.colorbar(tc, ax=ax, shrink=0.9, pad=0.01)
         self.fig.tight_layout()
         self.canvas.draw_idle()
+
+    def _periodic_pitch(self):
+        """Spanwise pitch of the case (y translation), 0 when unknown."""
+        if getattr(self, "_pitch_cache", None) is not None:
+            return self._pitch_cache
+        pitch = 0.0
+        case_path = self.app.state.case_dir() / "case.json"
+        if case_path.exists():
+            try:
+                case = json.loads(case_path.read_text())
+                pers = (case.get("cascade") or {}).get("periodic") or []
+                if pers:
+                    pitch = float(
+                        (pers[0].get("translation") or [0, 0, 0])[1] or 0.0)
+            except Exception:
+                pitch = 0.0
+        self._pitch_cache = pitch
+        return pitch
 
     def draw_surface(self):
         """1D surface distributions (SS/PS curves over u in [0, 1])."""
@@ -476,7 +515,13 @@ class SolutionTab(ttk.Frame):
         return "\n".join(lines)
 
     # --------------------------------------------------------- live mode
+    def _update_buttons(self):
+        running = self.app.job is not None and self.app.job.running
+        self.run_btn.configure(state="disabled" if running else "normal")
+        self.stop_btn.configure(state="normal" if running else "disabled")
+
     def on_job_event(self, kind, data):
+        self._update_buttons()
         if kind == "stage":
             if data["state"] == "start" and "SU2 solve" in data["title"]:
                 self._start_live()

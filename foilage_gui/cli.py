@@ -109,6 +109,18 @@ def smoke(app):
     else:
         print("smoke: default case has no vol_solution*.vtk - "
               "field-view assertions skipped")
+    # regression: run-job validation must pass on a well-formed case
+    # (empty dynamic-choice widgets used to raise KeyError -> an error
+    # dialog listing an empty message)
+    issues = [i for i in app.state.validate() if i[0] == "error"]
+    for tab in app._tabs:
+        if hasattr(tab, "fields"):
+            for widget in tab.fields.values():
+                ok, err = widget.validate()
+                if not ok and err:
+                    issues.append(("error", err))
+    assert not issues, f"run validation failed on a valid case: {issues}"
+    print("smoke: run validation OK")
     _pump(root, 4)
     assert not errors, f"Tk callback errors: {errors[0]!r}"
     root.destroy()

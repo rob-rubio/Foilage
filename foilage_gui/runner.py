@@ -11,6 +11,7 @@ if the GUI is closed while SU2 runs.
 
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -90,6 +91,10 @@ class Job:
                        reason=f"internal error: {e}")
 
     def _run_stage(self, stage):
+        # a solve stage with warm start enabled picks up restart.dat: the
+        # patch must happen here because the setup stage re-renders the cfg
+        if stage.get("watch_pid") and getattr(self, "restart", False):
+            self._patch_restart(stage)
         logf = None
         try:
             if stage.get("logfile"):
@@ -120,6 +125,22 @@ class Job:
         if rc != 0:
             raise StageFailed(f"exit code {rc}")
 
+    def _patch_restart(self, stage):
+        """Point the solve cfg at restart.dat (RESTART_SOL= YES)."""
+        cfg_path = Path(stage["cwd"]) / "turbine.cfg"
+        try:
+            text = cfg_path.read_text()
+            if "RESTART_SOL" in text:
+                text = re.sub(r"(?m)^RESTART_SOL=.*$", "RESTART_SOL= YES",
+                              text)
+            else:
+                text = text.rstrip("\n") + "\nRESTART_SOL= YES\n"
+            cfg_path.write_text(text)
+            self._emit("log", line=f"[restart] RESTART_SOL= YES written to "
+                                   f"{cfg_path.name}\n")
+        except OSError as e:
+            self._emit("log", line=f"[restart] could not patch cfg: {e}\n")
+
     def _spawn_watchdog(self, stage):
         case_dir = stage["case_dir"]
         wlog = open(Path(case_dir) / "watchdog.log", "w")
@@ -137,7 +158,10 @@ class StageFailed(Exception):
 
 def _popen_flags():
     if os.name == "nt":
-        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        # CREATE_NO_WINDOW keeps SU2/python children from popping up a
+        # console window when the GUI itself runs without one
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP
+                | subprocess.CREATE_NO_WINDOW}
     return {"start_new_session": True}
 
 
@@ -189,4 +213,5 @@ def build_job(state, mode, threads, su2_exe):
         stages.append(solve_stage(state, case_dir, threads, su2_exe))
     job = Job(mode, stages)
     job.case_dir = case_dir
+    job.restart = bool(state.get("solver_settings.restart"))
     return job

@@ -119,16 +119,23 @@ class CaseState:
             issues.append(("error",
                            f"Outlet static pressure ({p2} Pa) must be below "
                            f"the inlet total pressure ({p01} Pa)."))
-        a1 = self.get("airfoil.alpha1")
-        a2 = self.get("airfoil.alpha2")
-        if a1 is not None and a2 is not None and abs(a2 - a1) < 1.0:
-            issues.append(("warning",
-                           "alpha1 ~= alpha2: the blade has almost no "
-                           "turning; check the metal angles."))
-        if a1 is not None and a2 is not None and a2 < a1:
-            issues.append(("info",
-                           "alpha2 < alpha1: clockwise turning, built as a "
-                           "CAP profile (suction side on top)."))
+        src_type = self.get("airfoil_source.type") or "pyturbo"
+        if src_type == "pyturbo":
+            a1 = self.get("airfoil.alpha1")
+            a2 = self.get("airfoil.alpha2")
+            if a1 is not None and a2 is not None and abs(a2 - a1) < 1.0:
+                issues.append(("warning",
+                               "alpha1 ~= alpha2: the blade has almost no "
+                               "turning; check the metal angles."))
+            if a1 is not None and a2 is not None and a2 < a1:
+                issues.append(("info",
+                               "alpha2 < alpha1: clockwise turning, built as "
+                               "a CAP profile (suction side on top)."))
+        if src_type == "geomturbo" and not self.get(
+                "airfoil_source.geomturbo_file"):
+            issues.append(("error",
+                           "geomTurbo source selected but no geomTurbo file "
+                           "is set."))
         n = self.get("domain.airfoil_count")
         if n is not None and n < 2:
             issues.append(("error", "Blade count N must be >= 2."))

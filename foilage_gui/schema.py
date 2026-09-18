@@ -109,6 +109,12 @@ SECTIONS = [
                   6000, 100, 100000, step=100,
                   tooltip="SU2 stops earlier once CONV_RESIDUAL_MINVAL is "
                           "reached for all fields."),
+        FieldSpec("solver_settings.restart", "Initialize from previous solution",
+                  "bool", False,
+                  tooltip="Warm-start the solve from restart.dat in the case "
+                          "folder (written by the previous solve). The "
+                          "solution vtk you see in the Solution tab is "
+                          "written from the same state."),
     ]),
     Section("setup", "Numerics", [
         FieldSpec("solver_settings.numerics.limiter", "Slope limiter",
@@ -131,6 +137,28 @@ SECTIONS = [
     ]),
 
     # --------------------------------------------------------------- geometry
+    Section("geometry", "Airfoil source", [
+        FieldSpec("airfoil_source.type", "Geometry source", "choice", "pyturbo",
+                  choices=[_c("pyturbo-aero", "pyturbo"),
+                           _c("geomTurbo import", "geomturbo")],
+                  tooltip="pyturbo-aero generates the blade from the "
+                          "parameters below; geomTurbo imports a section "
+                          "from a NUMECA .geomTurbo file and uses it for "
+                          "meshing as-is (normalized to axial chord = 1)."),
+        FieldSpec("airfoil_source.geomturbo_file", "geomTurbo file", "file", "",
+                  tooltip="Path to a NUMECA .geomTurbo file. Sections found "
+                          "in the blade block become available in the "
+                          "Section dropdown."),
+        FieldSpec("airfoil_source.section", "Section", "choice", 0,
+                  choices=[_c("(load a geomTurbo file)", 0)],
+                  tooltip="Blade section to use, in file order. The label "
+                          "shows the section's Z value."),
+        FieldSpec("airfoil_source.show_reference", "Show geomTurbo reference",
+                  "bool", True,
+                  tooltip="While pyturbo-aero is the source, overlay the "
+                          "imported geomTurbo section in gray so the "
+                          "generated blade can be matched to it manually."),
+    ]),
     Section("geometry", "Camberline", [
         FieldSpec("airfoil.alpha1", "Inlet metal angle alpha1", "float",
                   10.0, -70.0, 70.0, slider=True, unit="deg",

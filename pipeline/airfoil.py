@@ -11,6 +11,36 @@ import numpy as np
 from pyturbo.aero import Airfoil2D
 
 
+def build_geometry(cfg):
+    """Dispatch on airfoil_source.type: pyturbo-aero generation (default)
+    or an imported geomTurbo section.
+
+    Returns the same airfoil dict for both sources so meshing and
+    post-processing are source-agnostic.
+    """
+    src = cfg.get("airfoil_source") or {}
+    if src.get("type") != "geomturbo":
+        return build_airfoil(cfg["airfoil"])
+
+    try:
+        from pipeline.geomturbo import parse_geomturbo, section_to_airfoil
+    except ImportError:
+        from geomturbo import parse_geomturbo, section_to_airfoil
+    file_path = src.get("geomturbo_file")
+    if not file_path:
+        raise ValueError("geomTurbo source selected but "
+                         "airfoil_source.geomturbo_file is empty")
+    sections = parse_geomturbo(file_path)
+    idx = int(src.get("section") or 0)
+    idx = max(0, min(idx, len(sections) - 1))
+    sec = sections[idx]
+    n = int(cfg.get("airfoil", {}).get("n_points", 401))
+    af = section_to_airfoil(sec["points"], n_points=n)
+    af["airfoil2d"] = None
+    af["section_z"] = sec["z"]
+    return af
+
+
 def build_airfoil(af_cfg):
     """Return dict with normalized suction/pressure side arrays and metadata.
 

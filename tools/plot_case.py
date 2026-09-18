@@ -194,24 +194,39 @@ def _volume_arrays(d):
             d["Velocity"][:, :2])
 
 
-def plot_fields(case_dir, pts, conn, mach, cp):
+def plot_fields(case_dir, pts, conn, mach, cp, pitch=0.0):
+    """Mach + Cp contour pictures.
+
+    With a periodic pitch (cascade cases) the contours are drawn three
+    times - main domain plus the upper and lower periodic copies - so the
+    neighbouring blades and the periodicity are visible.
+    """
+    shifts = (-pitch, 0.0, pitch) if pitch else (0.0,)
     fig, axes = plt.subplots(2, 1, figsize=(9, 5.6))
     for ax, (fld, title, cmap) in zip(
         axes,
         [(mach, "Mach number", "viridis"), (cp, r"pressure coefficient $C_p$", "coolwarm")],
     ):
-        tc = ax.tricontourf(pts[:, 0], pts[:, 1], conn, fld, levels=60, cmap=cmap)
+        for dy in shifts:
+            tc = ax.tricontourf(pts[:, 0], pts[:, 1] + dy, conn, fld,
+                                levels=60, cmap=cmap)
         ax.set_aspect("equal")
         ax.set_xlim(pts[:, 0].min(), pts[:, 0].max())
-        ax.set_ylim(pts[:, 1].min(), pts[:, 1].max())
-        ax.set_title(title, fontsize=10)
+        ymin, ymax = pts[:, 1].min(), pts[:, 1].max()
+        if pitch:
+            ymin -= 0.45 * pitch
+            ymax += 0.45 * pitch
+        ax.set_ylim(ymin, ymax)
+        ax.set_title(title + ("  (with periodic copies)" if pitch else ""),
+                     fontsize=10)
         ax.set_xlabel("x")
         ax.set_ylabel("y")
         fig.colorbar(tc, ax=ax, shrink=0.9, pad=0.01)
     fig.tight_layout()
     fig.savefig(case_dir / "fields.png")
     plt.close(fig)
-    print(f"fields.png  (max Mach = {mach.max():.3f})")
+    print(f"fields.png  (max Mach = {mach.max():.3f})"
+          + (f"  [+/- pitch periodic copies]" if pitch else ""))
 
 
 # ---------------------------------------------------------------- near wall
@@ -701,7 +716,12 @@ def main():
     d = load_volume(case_dir)
     pts, conn, mach, cp, vel = _volume_arrays(d)
     plot_convergence(case_dir, case_name, case.get("unsteady"))
-    plot_fields(case_dir, pts, conn, mach, cp)
+    pitch = 0.0
+    if "cascade" in case:
+        pers = case["cascade"].get("periodic") or []
+        if pers:
+            pitch = float((pers[0].get("translation") or [0, 0, 0])[1] or 0.0)
+    plot_fields(case_dir, pts, conn, mach, cp, pitch=pitch)
     gamma = case["physics"].get("gamma", GAMMA)
     ss_upper = case.get("postprocess", {}).get("ss_upper", True)
     if "cascade" in case:

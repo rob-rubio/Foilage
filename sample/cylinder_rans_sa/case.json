@@ -1,0 +1,48 @@
+{
+  "mesh": "mesh.su2",
+  "physics": {
+    "solver": "RANS",
+    "turbulence_model": "SA",
+    "mach": 0.5,
+    "reynolds": 100000.0,
+    "reynolds_length": 1.0,
+    "freestream_temperature": 288.15
+  },
+  "markers": {
+    "inlet": {"bc": "inlet", "direction": [1.0, 0.0, 0.0], "analyze": true},
+    "outlet": {"bc": "outlet"},
+    "freestream": {"bc": "farfield"},
+    "cylinder": {"bc": "wall_adiabatic"}
+  },
+  "numerics": {
+    "limiter": "NONE",
+    "gradient": "WEIGHTED_LEAST_SQUARES",
+    "cfl": 10.0,
+    "cfl_adapt": false,
+    "linear_solver_iter": 100
+  },
+  "convergence": {
+    "fields": ["RMS_DENSITY", "RMS_ENERGY"],
+    "minval": -4.0,
+    "startiter": 1,
+    "iterations": 999999
+  },
+  "unsteady": {
+    "time_step": 1.0e-3,
+    "time_steps": 750,
+    "inner_iter": 40,
+    "window_start_iter": 300,
+    "window_cauchy_elems": 100,
+    "history_wrt_freq_inner": 5,
+    "output_wrt_freq": [1500, 1500, 1500, 100, 1500]
+  },
+  "output": {
+    "files": ["RESTART", "PARAVIEW", "SURFACE_PARAVIEW",
+              "PARAVIEW_LEGACY", "SURFACE_PARAVIEW_LEGACY"]
+  },
+  "postprocess": {
+    "wall_hint": [0.0, 0.0],
+    "probe": {"point": [0.0, 0.5], "normal": [0.0, 1.0], "length": 1.2},
+    "zoom": {"xmin": -1.6, "xmax": 3.4, "ymin": -1.4, "ymax": 1.4}
+  }
+}

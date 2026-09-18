@@ -22,12 +22,17 @@ with --scale (meters per chord unit).
 import argparse
 import json
 import math
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
+
+# keep spawned solver/python processes from opening console windows when
+# this script runs from a windowless parent (e.g. the Foilage GUI)
+CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 REPO = Path(__file__).resolve().parent.parent
 if str(REPO) not in sys.path:
@@ -246,7 +251,8 @@ def main():
         py = Path(sys.executable)
         print(f"[mesh] running pipeline ({'--remesh' if args.remesh else 'mesh missing'}) ...")
         subprocess.run([str(py), str(proj / "pipeline" / "run_pipeline.py"),
-                        str(case_root / "input.json")], check=True)
+                        str(case_root / "input.json")], check=True,
+                       creationflags=CREATE_NO_WINDOW)
     if not mesh_src.exists():
         sys.exit(f"mesh not found at {mesh_src} (run with --remesh)")
 
@@ -339,7 +345,8 @@ def main():
     subprocess.run([sys.executable, str(REPO / "tools" / "render_config.py"),
                     str(su2_dir / "case.json"),
                     str(REPO / "templates" / "su2_cascade.cfg"),
-                    str(su2_dir / "turbine.cfg")], check=True)
+                    str(su2_dir / "turbine.cfg")], check=True,
+                   creationflags=CREATE_NO_WINDOW)
 
     # ---- validate periodic pairing + BCs (2 iterations)
     if not args.skip_validate:
@@ -362,7 +369,8 @@ def main():
         (su2_dir / "validate.cfg").write_text(text)
         r = subprocess.run([str(su2_exe),
                             "-t", "6", "validate.cfg"],
-                           cwd=str(su2_dir), capture_output=True, text=True, timeout=300)
+                           cwd=str(su2_dir), capture_output=True, text=True,
+                           timeout=300, creationflags=CREATE_NO_WINDOW)
         log = r.stdout + r.stderr
         if r.returncode != 0 or "Matched" not in log:
             sys.exit(f"validation FAILED:\n{log[-1500:]}")
@@ -383,7 +391,7 @@ def main():
                        str(su2_dir), "turbine.cfg", "-t", "6"]
         if args.config:
             monitor_cmd += ["--config", str(args.config)]
-        subprocess.Popen(monitor_cmd)
+        subprocess.Popen(monitor_cmd, creationflags=CREATE_NO_WINDOW)
 
 
 if __name__ == "__main__":
