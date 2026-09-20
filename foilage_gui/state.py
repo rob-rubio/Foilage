@@ -136,6 +136,47 @@ class CaseState:
             issues.append(("error",
                            "geomTurbo source selected but no geomTurbo file "
                            "is set."))
+        if src_type not in ("pyturbo", "geomturbo"):
+            # an extension plugin must exist and be loadable
+            try:
+                from pipeline.plugins import get_plugin
+                plugin = get_plugin(src_type)
+            except Exception:
+                plugin = None
+            if plugin is None:
+                issues.append((
+                    "error",
+                    f"Geometry source '{src_type}' is not a known plugin - "
+                    "check the extensions directory (directory with a "
+                    "plugin.json manifest)."))
+            elif plugin.get("error"):
+                issues.append(("error",
+                               f"Geometry plugin '{plugin.get('name')}': "
+                               f"{plugin['error']}"))
+        morph = self.get("airfoil_source.morph") or {}
+        if morph.get("enabled"):
+            mn = morph.get("n")
+            try:
+                mn = int(mn)
+            except (TypeError, ValueError):
+                mn = 0
+            if mn < 2:
+                issues.append(("error",
+                               "Morph points per direction must be >= 2."))
+            else:
+                for key in ("dx", "dy"):
+                    vals = morph.get(key) or []
+                    if len(vals) != mn * mn:
+                        issues.append((
+                            "error",
+                            f"Morph {key} offsets must hold N_morph^2 = "
+                            f"{mn * mn} values (got {len(vals)}); change "
+                            "N_morph or reset the cage."))
+                    elif not all(
+                            isinstance(v, (int, float)) for v in vals):
+                        issues.append(("error",
+                                       f"Morph {key} offsets must be "
+                                       "numbers."))
         n = self.get("domain.airfoil_count")
         if n is not None and n < 2:
             issues.append(("error", "Blade count N must be >= 2."))

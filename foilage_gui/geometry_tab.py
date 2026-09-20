@@ -5,6 +5,14 @@ section) and the periodic passage envelope whenever a geometry field
 changes (debounced), on a worker thread - the GUI stays responsive while
 splines rebuild. Below the blade view, two inspection charts show the
 channel width (with the throat) and the surface curvature.
+
+Panels adapt to the airfoil source: pyturbo shows the generator panels
+(camberline, thickness, trailing edge, flow guidance); a geomTurbo
+import shows the file/section fields plus the FFD morph cage instead.
+The discretisation and domain panels apply to both sources. With the
+morph enabled, the imported section is deformed by an N_morph x N_morph
+cage of control points (dx/dy per point) and the cage is drawn over the
+blade preview.
 """
 
 import queue
@@ -28,13 +36,23 @@ for p in (str(REPO), str(REPO / "pipeline")):
         sys.path.insert(0, p)
 
 from pipeline.airfoil import build_geometry           # noqa: E402
-from pipeline.cascade_metrics import channel_widths, curvature, throat_metrics
+from pipeline.cascade_metrics import (channel_widths, curvature, throat_metrics,
+                                       true_chord)
+from pipeline.ffd import MAX_N, MIN_N, bernstein_basis  # noqa: E402
 from pipeline.mesh_tris import pitch_profile, periodic_edges  # noqa: E402
+from pipeline.plugins import (discover_plugins, type_choices)  # noqa: E402
 
-from .schema import sections_for                       # noqa: E402
-from .widgets import FieldWidget, ScrolledFrame        # noqa: E402
+from .schema import field_from_dict, sections_for      # noqa: E402
+from .widgets import INVALID_BG, FieldWidget, ScrolledFrame, Tooltip  # noqa: E402
 
 DEBOUNCE_MS = 250
+MORPH_TITLE = "geomTurbo morph (FFD cage)"
+PLUGIN_KEY = "@plugin-generators"       # synthetic key for the plugin host
+PLUGIN_PREFIX = "airfoil_source.params."
+# sections that apply to every airfoil source (everything else is
+# pyturbo-generator specific and hidden for a geomTurbo import)
+SHARED_SECTIONS = {"Airfoil source", MORPH_TITLE, "Discretisation",
+                   "Domain (periodic passage)"}
 
 
 def _compute_geometry(cfg):
@@ -55,9 +73,10 @@ def _compute_geometry(cfg):
         ss, ps = airfoil["ss"], airfoil["ps"]
 
         # ---- channel + throat (blade vs pitch-translated neighbor) ----
-        pitch = float(prof["p_le"])         # R1 == R2 for SU2 periodicity
+        pitch = prof["p"]
         s_ch, _j = channel_widths(ss, ps, pitch, airfoil["ss_upper"])
         throat = throat_metrics(ss, ps, pitch, airfoil["ss_upper"])
+        chord_cax = true_chord(ss, ps)
 
         # ---- surface curvature ----
         k_ss, _s_ss = curvature(ss)
@@ -97,8 +116,13 @@ def _compute_geometry(cfg):
             if None not in (a1, a2) and src.get("type", "pyturbo") == "pyturbo"
             else None,
             "p_le": prof["p_le"], "p_te": prof["p_te"],
+            "true_chord_cax": chord_cax,
+            "radius_throat_cax": float(prof["radius"](
+                throat["x_over_cax"])),
+            "pitch_to_chord": throat["pitch_throat"] / max(chord_cax, 1e-30),
             "source": src.get("type", "pyturbo"),
             "blade_count": airfoil.get("blade_count"),
+            "morph_cage": airfoil.get("morph_cage"),
             "import_pts": import_pts,
             "import_err": ref_err,
             "import_mtime": import_mtime,
@@ -131,16 +155,56 @@ class GeometryTab(ttk.Frame):
         pane.add(left, weight=1)
         form = ScrolledFrame(left)
         form.pack(fill="both", expand=True)
+        self._section_frames = {}
+        self._section_visible = {}
+        self._morph_cells = {}
+        self._morph_grid = None
+        self._grid_n = 0
+        self._morph_loading = False
+        self._plugins = discover_plugins()
+        self._plugin_warnings = [f"{p['name']}: {p['error']}"
+                                 for p in self._plugins if p["error"]]
+        self._active_plugin_id = None
+        self._plugin_field_paths = []
         for section in sections_for("geometry"):
             box = ttk.LabelFrame(form.inner, text=f" {section.title} ")
             box.pack(fill="x", padx=6, pady=(8, 2))
+            self._section_frames[section.title] = box
+            self._section_visible[section.title] = True
+            if section.title == MORPH_TITLE:
+                self._build_morph_panel(box)
+                continue
             for spec in section.fields:
                 w = FieldWidget(box, spec, self._commit)
                 self.fields[spec.path] = w
             if section.title == "Airfoil source":
-                ttk.Button(box, text="Save as geomTurbo ...",
+                # the export button lives in its own row so the source
+                # panel can be relaid out with the fields
+                btn_row = ttk.Frame(box)
+                ttk.Button(btn_row, text="Save as geomTurbo ...",
                            command=self._export_geomturbo).pack(
                     anchor="e", padx=4, pady=(2, 4))
+                btn_row.pack(fill="x")
+                self._source_extra = btn_row
+                # host for the extension-plugin parameter panels; it sits
+                # directly under the source selection like the morph panel
+                host = ttk.Frame(form.inner)
+                host.pack(fill="x")
+                self._plugin_host = host
+                self._section_frames[PLUGIN_KEY] = host
+                self._section_visible[PLUGIN_KEY] = False
+        # rows of the Airfoil source panel in display order; the second
+        # item is the source each row belongs to (None = always shown)
+        self._source_rows = [
+            ("airfoil_source.type", None),
+            ("airfoil_source.geomturbo_file", "geomturbo"),
+            ("airfoil_source.section", "geomturbo"),
+            ("airfoil_source.show_reference", "pyturbo"),
+        ]
+        # extension plugins join the source dropdown (labels + ids)
+        choices = list(self.fields["airfoil_source.type"].spec.choices) \
+            + type_choices(self._plugins)
+        self.fields["airfoil_source.type"].set_choices(choices)
 
         hint = tk.Label(left, text="Sliders update the preview on release; "
                         "type exact values in the boxes and press Enter.",
@@ -188,7 +252,329 @@ class GeometryTab(ttk.Frame):
         self.reload_fields()
         self._refresh_sections(commit=False)
         self._infer_from_geomturbo()
+        self._update_source_panels()
         self.schedule_regeneration(immediate=True)
+
+    # ------------------------------------------------- source panel layout
+    def _plugin_label(self, plugin_id):
+        for p in self._plugins:
+            if p["id"] == plugin_id:
+                return p["name"]
+        return plugin_id
+
+    def _update_source_panels(self):
+        """Show/hide the source-specific panels: the pyturbo generator
+        panels for the pyturbo source; the geomTurbo import fields, the
+        FFD morph cage and the selected plugin's parameter panels for
+        non-pyturbo sources. Discretisation and Domain apply to both and
+        stay visible."""
+        src = self.app.state.get("airfoil_source.type") or "pyturbo"
+        is_plugin = src not in ("pyturbo", "geomturbo")
+        if is_plugin:
+            if self._active_plugin_id != src:
+                self._rebuild_plugin_panel(src)
+        elif self._active_plugin_id is not None:
+            self._rebuild_plugin_panel(None)     # tear the panel down
+        for title in self._section_frames:
+            if title == MORPH_TITLE:
+                self._section_visible[title] = (src != "pyturbo")
+            elif title == PLUGIN_KEY:
+                self._section_visible[title] = is_plugin
+            elif title in SHARED_SECTIONS:
+                continue
+            else:
+                self._section_visible[title] = (src == "pyturbo")
+        # forget everything and repack in schema order so the visible
+        # panels keep their original stacking
+        for title, box in self._section_frames.items():
+            box.pack_forget()
+            if self._section_visible[title]:
+                box.pack(fill="x", padx=6, pady=(8, 2))
+        box = self._section_frames["Airfoil source"]
+        for path, when in self._source_rows:
+            self.fields[path].frame.pack_forget()
+        self._source_extra.pack_forget()
+        for path, when in self._source_rows:
+            if when is None or when == src:
+                self.fields[path].frame.pack(fill="x", padx=4, pady=1)
+        self._source_extra.pack(fill="x")
+
+    # ------------------------------------------------------ plugin panels
+    def _rebuild_plugin_panel(self, plugin_id):
+        """(Re)build the parameter panels of the selected extension
+        plugin from its manifest; plugin_id None tears the panel down."""
+        self._active_plugin_id = plugin_id
+        for path in self._plugin_field_paths:
+            self.fields.pop(path, None)
+        self._plugin_field_paths = []
+        for child in self._plugin_host.winfo_children():
+            child.destroy()
+        if plugin_id is None:
+            return
+        plugin = next((p for p in self._plugins if p["id"] == plugin_id),
+                      None)
+        if plugin is None:
+            tk.Label(self._plugin_host,
+                     text=f"unknown geometry plugin '{plugin_id}' - check "
+                          "the extensions directory",
+                     fg="#a00", wraplength=280,
+                     justify="left").pack(fill="x", padx=4, pady=4)
+            return
+        if plugin["error"]:
+            tk.Label(self._plugin_host,
+                     text=f"plugin '{plugin['name']}' cannot be used: "
+                          f"{plugin['error']}",
+                     fg="#a00", wraplength=280,
+                     justify="left").pack(fill="x", padx=4, pady=4)
+            return
+        # seed declared defaults so the CLI always receives full values
+        for spec in plugin["parameters"]:
+            full = PLUGIN_PREFIX + spec["path"]
+            if self.app.state.get(full) is None \
+                    and spec.get("default") is not None:
+                self.app.state.set(full, spec["default"], notify=False)
+        for group in plugin["groups"]:
+            if not group["params"]:
+                continue
+            gbox = ttk.LabelFrame(self._plugin_host,
+                                  text=f" {group['title']} ")
+            gbox.pack(fill="x", pady=(4, 2))
+            for spec_dict in group["params"]:
+                spec = field_from_dict(spec_dict, prefix=PLUGIN_PREFIX)
+                w = FieldWidget(gbox, spec, self._plugin_commit)
+                self.fields[spec.path] = w
+                self._plugin_field_paths.append(spec.path)
+                w.set_value(self.app.state.get(spec.path))
+        if plugin["description"]:
+            tk.Label(self._plugin_host, text=plugin["description"],
+                     justify="left", wraplength=280,
+                     font=("TkDefaultFont", 8),
+                     fg="#595959").pack(fill="x", padx=4, pady=(2, 4))
+
+    def _plugin_commit(self, spec, value):
+        """A plugin parameter changed: store it; the state notification
+        triggers a preview regeneration, which re-runs the plugin CLI."""
+        self.app.state.set(spec.path, value)
+        self.status_var.set(f"{self._plugin_label(self._active_plugin_id)}: "
+                            f"{spec.label} = {value} - regenerating ...")
+
+    # ------------------------------------------------------------ morph UI
+    def _build_morph_panel(self, box):
+        """Controls for the FFD morph cage: enable, N_morph, reset, and
+        the N_morph x N_morph grid of dx/dy entries laid out like the
+        cage itself (u across, v upwards)."""
+        m = self.app.state.get("airfoil_source.morph") or {}
+        bar = ttk.Frame(box)
+        bar.pack(fill="x", padx=4, pady=(2, 2))
+        self._morph_enabled_var = tk.BooleanVar(value=bool(m.get("enabled")))
+        cb = ttk.Checkbutton(bar, text="Enable morphing",
+                             variable=self._morph_enabled_var,
+                             command=self._morph_enabled_commit)
+        cb.pack(side="left")
+        Tooltip(cb, "Deform the imported section with the control cage "
+                    "below before meshing. The preview, the mesh and any "
+                    "optimization evaluations all use the morphed shape "
+                    "(stored in input.json).")
+        tk.Label(bar, text="N_morph:",
+                 font=("TkDefaultFont", 8)).pack(side="left", padx=(12, 2))
+        self._morph_n_var = tk.IntVar(
+            value=max(MIN_N, min(MAX_N, int(m.get("n") or 4))))
+        spin = ttk.Spinbox(bar, from_=MIN_N, to=MAX_N, width=3,
+                           textvariable=self._morph_n_var,
+                           command=self._morph_n_commit)
+        spin.pack(side="left")
+        spin.bind("<Return>", self._morph_n_commit)
+        spin.bind("<FocusOut>", self._morph_n_commit)
+        Tooltip(spin, "The cage is an N_morph x N_morph grid of control "
+                      "points around the section; changing it resamples "
+                      "the current deformation onto the new lattice.")
+        ttk.Button(bar, text="Reset offsets",
+                   command=self._morph_reset).pack(side="left", padx=(12, 0))
+
+        self._morph_grid_host = ttk.Frame(box)
+        self._morph_grid_host.pack(fill="x", padx=4, pady=(0, 2))
+        self._rebuild_morph_grid()
+        note = tk.Label(
+            box, justify="left", wraplength=280, font=("TkDefaultFont", 8),
+            fg="#595959",
+            text="Each cell is one cage control point (top: dx, bottom: "
+                 "dy, in axial-chord units; drag-free - type and press "
+                 "Enter). Equal offsets translate the blade, corner "
+                 "offsets rotate/shear, symmetric offsets stretch, single "
+                 "points make local bumps. The cage box hugs the section "
+                 "bounding box (+8% margin).")
+        note.pack(fill="x", padx=4, pady=(0, 3))
+
+    def _rebuild_morph_grid(self):
+        """Recreate the cage entry grid for the current N_morph."""
+        if self._morph_grid is not None:
+            self._morph_grid.destroy()
+        n = max(MIN_N, min(MAX_N, int(self._morph_n_var.get() or 4)))
+        self._grid_n = n
+        grid = ttk.Frame(self._morph_grid_host)
+        grid.pack(fill="x")
+        self._morph_grid = grid
+        self._morph_cells = {}
+        dx_vals, dy_vals = self._state_offsets(n)
+        width = 6 if n <= 4 else (5 if n <= 6 else 4)
+        small = ("TkDefaultFont", 7)
+        tk.Label(grid, text="dx / dy", font=small, fg="#737373").grid(
+            row=0, column=0, padx=(0, 2))
+        for i in range(n):
+            tk.Label(grid, text=f"u{i}", font=small,
+                     fg="#737373").grid(row=0, column=1 + i, padx=2)
+        for r in range(n):
+            j = n - 1 - r                     # top row of the grid = v max
+            tk.Label(grid, text=f"v{j}", font=small, fg="#737373").grid(
+                row=1 + r, column=0, sticky="e", padx=(0, 2))
+            for i in range(n):
+                cell = ttk.Frame(grid)
+                cell.grid(row=1 + r, column=1 + i, padx=1, pady=1)
+                entries = []
+                for val in (dx_vals[i * n + j], dy_vals[i * n + j]):
+                    e = tk.Entry(cell, width=width, font=("Consolas", 8),
+                                 justify="right", relief="solid", bd=1)
+                    e.insert(0, FieldWidget._fmt(val))
+                    e.pack(side="top", anchor="w")
+                    e.bind("<Return>", self._morph_cell_commit)
+                    e.bind("<FocusOut>", self._morph_cell_commit)
+                    Tooltip(e, f"cage point (u{i}, v{j}): offset in "
+                               f"{'x' if len(entries) == 0 else 'y'} "
+                               "[axial chord]")
+                    entries.append(e)
+                self._morph_cells[(i, j)] = tuple(entries)
+
+    def _state_offsets(self, n):
+        """dx/dy flat lists from the case state, normalized to n*n values
+        (resampled from an older grid size, or padded/truncated)."""
+        m = self.app.state.get("airfoil_source.morph") or {}
+        return (self._coerce_offsets(m.get("dx"), n),
+                self._coerce_offsets(m.get("dy"), n))
+
+    @staticmethod
+    def _resample_offsets(old_n, flat, new_n):
+        """Evaluate the deformation field of an old_n x old_n cage at the
+        control points of a new_n x new_n lattice."""
+        us = np.linspace(0.0, 1.0, new_n)
+        uu, vv = np.meshgrid(us, us, indexing="ij")
+        bu = bernstein_basis(old_n, uu.ravel())
+        bv = bernstein_basis(old_n, vv.ravel())
+        mat = np.asarray(flat, dtype=float).reshape(old_n, old_n)
+        return np.einsum("ki,ij,kj->k", bu, mat, bv).tolist()
+
+    def _coerce_offsets(self, vals, n):
+        vals = [float(v) for v in (vals or [])]
+        if len(vals) == n * n:
+            return vals
+        old_n = int(round(len(vals) ** 0.5)) if vals else 0
+        if MIN_N <= old_n <= MAX_N and old_n * old_n == len(vals):
+            return self._resample_offsets(old_n, vals, n)
+        return (vals + [0.0] * (n * n))[:n * n]
+
+    def _morph_cell_commit(self, _e=None):
+        """Read the whole cage grid, store it in the case state and
+        regenerate the preview. Invalid entries are flagged red."""
+        if self._morph_loading:
+            return
+        n = self._grid_n
+        dx, dy, bad = [], [], []
+        for (i, j) in sorted(self._morph_cells):
+            for e, acc in zip(self._morph_cells[(i, j)], (dx, dy)):
+                text = e.get().strip()
+                try:
+                    acc.append(float(text.replace(",", ".")) if text
+                               else 0.0)
+                    e.configure(background="white")
+                except ValueError:
+                    bad.append(e)
+                    acc.append(0.0)
+        for e in bad:
+            e.configure(background=INVALID_BG)
+        if bad:
+            return
+        self.app.state.set("airfoil_source.morph.dx", dx)
+        self.app.state.set("airfoil_source.morph.dy", dy)
+        moved = sum(1 for v in dx + dy if abs(v) > 1e-12)
+        self.status_var.set(f"morph cage: {moved} offset(s) set, "
+                            "rebuilding ...")
+
+    def _morph_n_commit(self, _e=None):
+        if self._morph_loading:
+            return
+        try:
+            n = int(self._morph_n_var.get())
+        except (ValueError, tk.TclError):
+            self._morph_n_var.set(self._grid_n)
+            return
+        n = max(MIN_N, min(MAX_N, n))
+        self._morph_n_var.set(n)
+        if n == self._grid_n:
+            return
+        # keep the current deformation: sample its field at the new
+        # control points (entries with invalid text fall back to state)
+        old_n = self._grid_n
+        try:
+            dx_old, dy_old = self._read_entries_flat(old_n)
+        except ValueError:
+            dx_old, dy_old = self._state_offsets(old_n)
+        self.app.state.set("airfoil_source.morph.n", n)
+        self.app.state.set("airfoil_source.morph.dx",
+                           self._resample_offsets(old_n, dx_old, n))
+        self.app.state.set("airfoil_source.morph.dy",
+                           self._resample_offsets(old_n, dy_old, n))
+        self._rebuild_morph_grid()
+
+    def _read_entries_flat(self, n):
+        dx, dy = [], []
+        for (i, j) in sorted(self._morph_cells):
+            ex, ey = self._morph_cells[(i, j)]
+            for e, acc in ((ex, dx), (ey, dy)):
+                text = e.get().strip()
+                acc.append(float(text.replace(",", ".")) if text else 0.0)
+        if len(dx) != n * n:
+            raise ValueError("entry grid does not match N_morph")
+        return dx, dy
+
+    def _morph_enabled_commit(self):
+        if self._morph_loading:
+            return
+        self.app.state.set("airfoil_source.morph.enabled",
+                           bool(self._morph_enabled_var.get()))
+        self.status_var.set(
+            "morphing enabled - the imported section is deformed by the "
+            "cage" if self._morph_enabled_var.get()
+            else "morphing disabled - imported section used as-is")
+
+    def _morph_reset(self):
+        if self._morph_loading:
+            return
+        n = self._grid_n
+        self.app.state.set("airfoil_source.morph.dx", [0.0] * (n * n))
+        self.app.state.set("airfoil_source.morph.dy", [0.0] * (n * n))
+        self._rebuild_morph_grid()
+        self.status_var.set("morph cage offsets reset to zero")
+
+    def _morph_load_from_state(self):
+        """Sync the morph panel with the case state (config reload)."""
+        self._morph_loading = True
+        try:
+            m = self.app.state.get("airfoil_source.morph") or {}
+            n = max(MIN_N, min(MAX_N, int(m.get("n") or 4)))
+            self._morph_n_var.set(n)
+            self._morph_enabled_var.set(bool(m.get("enabled")))
+            if self._grid_n != n:
+                self._rebuild_morph_grid()      # fills from the state
+            else:
+                dx_vals, dy_vals = self._state_offsets(n)
+                for (i, j), (ex, ey) in self._morph_cells.items():
+                    ex.delete(0, "end")
+                    ex.insert(0, FieldWidget._fmt(dx_vals[i * n + j]))
+                    ey.delete(0, "end")
+                    ey.insert(0, FieldWidget._fmt(dy_vals[i * n + j]))
+                    ex.configure(background="white")
+                    ey.configure(background="white")
+        finally:
+            self._morph_loading = False
 
     # ------------------------------------------------------------- fields
     def _commit(self, spec, value):
@@ -198,6 +584,7 @@ class GeometryTab(ttk.Frame):
             self._infer_from_geomturbo()
         elif spec.path == "airfoil_source.type":
             self._refresh_sections(commit=False)
+            self._update_source_panels()
             if value == "geomturbo":
                 self._infer_from_geomturbo()
             elif value == "pyturbo" and self._ac_before_infer is not None:
@@ -319,6 +706,7 @@ class GeometryTab(ttk.Frame):
     def reload_fields(self):
         for path, widget in self.fields.items():
             widget.set_value(self.app.state.get(path))
+        self._morph_load_from_state()
 
     def on_state_changed(self, paths):
         if any(p.startswith(("airfoil.", "domain.", "airfoil_source."))
@@ -378,14 +766,23 @@ class GeometryTab(ttk.Frame):
 
     def _status_text(self, g):
         parts = [f"{g['style'].upper()} profile"]
+        if g["source"] not in ("pyturbo", "geomturbo"):
+            parts.append(f"plugin: {self._plugin_label(g['source'])}")
         if g["turning"] is not None:
             parts.append(f"turning {g['turning']:.1f} deg")
         parts.append(f"pitch LE {g['p_le']:.4f}, TE {g['p_te']:.4f}")
+        parts.append(f"PTC {g['pitch_to_chord']:.4f}")
         parts.append(f"{g['n_points']} points/side")
         if g.get("blade_count") is not None:
             parts.append(f"{g['blade_count']} blades")
+        if g.get("morph_cage"):
+            parts.append(f"FFD-morphed ({g['morph_cage']['n']}x"
+                         f"{g['morph_cage']['n']} cage)")
         if g["import_err"]:
             parts.append(f"geomTurbo reference failed ({g['import_err']})")
+        if self._plugin_warnings:
+            parts.append(f"{len(self._plugin_warnings)} extension(s) "
+                         "skipped (bad manifest)")
         return "  |  ".join(parts)
 
     def _update_metrics(self, g):
@@ -394,6 +791,8 @@ class GeometryTab(ttk.Frame):
         self.metrics_var.set(
             f"throat {t['width']:.4f} c_ax ({t['width'] * scale_mm:.2f} mm) "
             f"@ x/c_ax {t['x_over_cax']:.3f}   |   "
+            f"true chord {g['true_chord_cax']:.4f} c_ax   |   "
+            f"PTC {g['pitch_to_chord']:.4f}   |   "
             f"\u03b1_throat {t['angle_throat_deg']:.1f}\u00b0   |   "
             f"unguided {t['unguided_turning_deg']:.1f}\u00b0")
 
@@ -424,6 +823,10 @@ class GeometryTab(ttk.Frame):
                     ls="--", zorder=3)
             ax.plot(ps_ref[:, 0], ps_ref[:, 1], color="0.45", lw=1.2,
                     ls="--", label=lbl, zorder=3)
+
+        # FFD morph cage: dotted = undeformed lattice, orange = deformed
+        if g.get("morph_cage"):
+            self._draw_cage(ax, g["morph_cage"])
 
         closed = np.vstack([outline, outline[0]])
         ax.fill(closed[:, 0], closed[:, 1], color="#dbe9f6", zorder=4)
@@ -465,6 +868,29 @@ class GeometryTab(ttk.Frame):
         ax.legend(fontsize=8, loc="upper right")
         self.fig.tight_layout()
         self.canvas.draw_idle()
+
+    def _draw_cage(self, ax, cage):
+        """Overlay the morph cage: dotted gray = undeformed lattice,
+        orange = control points displaced by their (dx, dy)."""
+        n = cage["n"]
+        cp0 = np.asarray(cage["cp0"])
+        cp1 = np.asarray(cage["cp"])
+        rows0 = cp0.reshape(n, n, 2)
+        for r in range(n):
+            ax.plot(rows0[r][:, 0], rows0[r][:, 1], color="0.75", lw=0.7,
+                    ls=":", zorder=2)
+            ax.plot(rows0[:, r][:, 0], rows0[:, r][:, 1], color="0.75",
+                    lw=0.7, ls=":", zorder=2)
+        label = "FFD morph cage"
+        rows1 = cp1.reshape(n, n, 2)
+        for r in range(n):
+            ax.plot(rows1[r][:, 0], rows1[r][:, 1], color="#e6821e",
+                    lw=0.9, alpha=0.85, zorder=3,
+                    label=label if r == 0 else None)
+            ax.plot(rows1[:, r][:, 0], rows1[:, r][:, 1], color="#e6821e",
+                    lw=0.9, alpha=0.85, zorder=3)
+        ax.plot(cp1[:, 0], cp1[:, 1], "o", ms=3.5, color="#e6821e",
+                zorder=3)
 
     def _draw_channel(self, g):
         fig, ax, cvs = self._chart_tabs["Channel"]

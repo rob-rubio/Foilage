@@ -103,8 +103,8 @@ def test_geomturbo_import():
     if str(REPO / "pipeline") not in sys.path:
         sys.path.insert(0, str(REPO / "pipeline"))
     from pipeline.airfoil import build_airfoil, build_geometry
-    from pipeline.cascade_metrics import channel_widths, curvature, \
-        throat_metrics
+    from pipeline.cascade_metrics import (channel_widths, curvature,
+                                           throat_metrics, true_chord)
     from pipeline.geomturbo import (infer_cascade_parameters,
                                     parse_geomturbo, section_to_airfoil,
                                     write_geomturbo)
@@ -206,7 +206,7 @@ def test_geomturbo_import():
     ref["axial_chord"] = float(cfg["airfoil"]["axial_chord"])
     from pipeline.mesh_tris import pitch_profile
     prof = pitch_profile(cfg["domain"], ref)
-    s_ch, _j = channel_widths(ref["ss"], ref["ps"], prof["p_le"],
+    s_ch, _j = channel_widths(ref["ss"], ref["ps"], prof["p"],
                               ref["ss_upper"])
     # CUP mirror check: flipping the blade vertically must give the same
     # channel widths (the neighbor direction flips with the surfaces)
@@ -214,14 +214,19 @@ def test_geomturbo_import():
     ps_m = ref["ps"].copy()
     ss_m[:, 1] *= -1.0
     ps_m[:, 1] *= -1.0
-    s_ch_m, _j = channel_widths(ss_m, ps_m, prof["p_le"],
+    s_ch_m, _j = channel_widths(ss_m, ps_m, prof["p"],
                                 not ref["ss_upper"])
     assert np.abs(s_ch - s_ch_m).max() < 1e-9, "CUP/CAP channel mismatch"
     assert 0.05 < s_ch.min() < prof["p_le"], "throat width out of range"
-    t = throat_metrics(ref["ss"], ref["ps"], prof["p_le"], ref["ss_upper"])
+    t = throat_metrics(ref["ss"], ref["ps"], prof["p"], ref["ss_upper"])
     assert 0.1 < t["x_over_cax"] < 0.95
     assert 0.0 < t["unguided_turning_deg"] < 45.0
     assert t["width"] > 0
+    chord_cax = true_chord(ref["ss"], ref["ps"])
+    assert chord_cax > 0.0
+    assert abs(t["pitch_throat"] - prof["p"](t["x_over_cax"])) < 1e-12
+    ptc = t["pitch_throat"] / chord_cax
+    assert ptc > 0.0
     k_ss, _ = curvature(ref["ss"])
     assert np.isfinite(k_ss).all() and k_ss.max() > k_ss.min()
 
@@ -310,12 +315,561 @@ def read_legacy_vtk_local(path):
     return read_legacy_vtk(str(path))
 
 
+def test_optimizer():
+    """Optimization engine core: NSGA-II operators, hypervolume,
+    constraint handling, catalogs, and the per-evaluation input writer
+    (no CFD runs)."""
+    import random
+    from foilage_gui.optimizer import (CONSTRAINT_QUANTITIES, DESIGN_VARS,
+                                       OBJECTIVES, PENALTY, OptimizationRun,
+                                       apply_kind, constraint_violation,
+                                       constrained_dominates, dominates,
+                                       hypervolume, lhs_sample,
+                                       nondominated_fronts,
+                                       polynomial_mutation, sbx_crossover)
+
+    F = [(0.0, 1.0), (0.5, 0.5), (1.0, 0.0), (0.4, 1.5), (0.5, 0.9),
+         (2.0, 2.0)]
+    fronts = nondominated_fronts(F)
+    assert sorted(fronts[0]) == [0, 1, 2] and sorted(fronts[1]) == [3, 4] \
+        and fronts[2] == [5], fronts
+    assert dominates((1, 1), (2, 2)) and not dominates((1, 2), (2, 1))
+
+    # constrained domination (Deb): feasibility beats objective quality
+    assert constrained_dominates((0.1, 0.1), 0.0, (0.0, 0.0), 0.5)
+    assert constrained_dominates((1.0, 1.0), 0.0, (0.0, 0.0), 1e9)
+    assert constrained_dominates((0.0, 0.0), 2.0, (5.0, 5.0), 3.0)
+    assert not constrained_dominates((0.0, 0.0), 3.0, (5.0, 5.0), 2.0)
+    assert constrained_dominates((0.0, 0.0), 0.0, (0.5, 0.5), 0.0)
+    # fronts with CV: an infeasible point never enters the first front
+    F2 = [(0.0, 0.0), (0.2, 0.2)]
+    CV2 = [0.5, 0.0]
+    assert 1 in nondominated_fronts(F2, CV2)[0] \
+        and 0 not in nondominated_fronts(F2, CV2)[0]
+
+    # constraint violation accounting (normalized by bound magnitude)
+    cons = [{"path": "a", "op": ">=", "value": 1.0},
+            {"path": "b", "op": "<=", "value": 0.5}]
+    assert constraint_violation({"a": 2.0, "b": 0.2}, cons) == 0.0
+    assert constraint_violation({"a": 0.5, "b": 0.2}, cons) == 0.5
+    assert constraint_violation({"a": 0.5, "b": 1.0}, cons) == 0.5 + 1.0
+    assert constraint_violation({"a": 2.0}, cons) >= 1.0   # missing b
+
+    # hypervolume: unit-square front monotone in the point set
+    hv_small = hypervolume([(0.5, 0.5)])
+    hv_big = hypervolume([(0.5, 0.5), (0.2, 0.8), (0.8, 0.2)])
+    assert hv_big > hv_small > 0.0, (hv_small, hv_big)
+
+    bounds = [(0.0, 1.0), (10.0, 20.0), (-5.0, 5.0)]
+    rng = random.Random(42)
+    sample = lhs_sample(bounds, 7, rng)
+    assert len(sample) == 7 and all(len(v) == 3 for v in sample)
+    for d in range(3):
+        col = [v[d] for v in sample]
+        assert all(bounds[d][0] <= c <= bounds[d][1] for c in col)
+    for _ in range(50):
+        c1, c2 = sbx_crossover([0.9, 15.0, 0.0], [0.1, 18.0, -4.0],
+                               bounds, 15.0, rng)
+        m = polynomial_mutation(c1, bounds, 20.0, rng)
+        for v, (lo, hi) in zip(list(c1) + list(c2) + m, bounds * 3):
+            assert lo <= v <= hi
+    assert apply_kind([2.4, 3.6], ["int", "float"]) == [2, 3.6]
+
+    # catalogs must reference real schema paths
+    schema_paths = {f.path for f in FIELDS_BY_PATH.values()}
+    for dv in DESIGN_VARS:
+        assert dv["path"] in schema_paths, dv["path"]
+    assert len({o["path"] for o in OBJECTIVES}) == len(OBJECTIVES)
+
+    # the per-evaluation input writer: dv overrides, R1=R2 sync, case copy
+    base = {"case": {"name": "x", "output_dir": "cases"},
+            "domain": {"R1": 9.0, "R2": 9.0}}
+    objs = [{"path": "a", "label": "a", "sense": "min"}]
+    dvs = [{"path": "domain.airfoil_count", "label": "N", "kind": "int",
+            "min": 2, "avg": 3, "max": 6}]
+    run = OptimizationRun(base, Path(tempfile.mkdtemp()) / "w", "wtag",
+                          objs, dvs, pop_size=4)
+    eval_dir = run._write_eval_input(1, 0, [5], "wtag_g001i00")
+    cfg_w = json.loads((eval_dir / "input.json").read_text())
+    assert cfg_w["domain"]["airfoil_count"] == 5
+    assert cfg_w["domain"]["R2"] == cfg_w["domain"]["R1"]
+    assert (REPO / "cases" / "wtag_g001i00" / "input.json").exists()
+
+    # a hanging stage is killed at its timeout and reported as timed out
+    import time as _time
+    t0 = _time.time()
+    rc, timed_out = run._run_stage(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        str(REPO), None, timeout=3)
+    assert timed_out and rc != 0 and _time.time() - t0 < 15, \
+        (rc, timed_out, _time.time() - t0)
+    rc2, to2 = run._run_stage([sys.executable, "-c", "print('ok')"],
+                              str(REPO), None, timeout=10)
+    assert rc2 == 0 and not to2
+
+    import shutil
+    shutil.rmtree(REPO / "cases" / "wtag_g001i00", ignore_errors=True)
+    shutil.rmtree(run.run_dir.parent, ignore_errors=True)
+    print(f"optimizer OK ({len(OBJECTIVES)} objectives, "
+          f"{len(DESIGN_VARS)} design vars; front/hypervolume/bounds)")
+
+
+def test_optimizer_pause_state():
+    """Pause/resume control and the optimizer_state.json save/load cycle
+    (instant fake evaluations - no CFD runs)."""
+    import queue as _queue
+    import shutil
+    import time as _time
+    from foilage_gui.optimizer import OptimizationRun, validate_state
+
+    base = {"case": {"name": "x", "output_dir": "cases"}}
+    objs = [{"path": "a", "label": "a", "sense": "min"}]
+    dvs = [{"path": "domain.airfoil_count", "label": "N", "kind": "int",
+            "min": 2, "avg": 3, "max": 6}]
+
+    def make(tag, run_dir):
+        r = OptimizationRun(base, run_dir, tag, objs, dvs, pop_size=4,
+                            max_generations=10000)
+
+        def fake_eval(gen, idx, values):
+            _time.sleep(0.005)          # let pause/stop land between evals
+            rec = r._make_record(gen, idx, values,
+                                 f"{tag}_g{gen:03d}i{idx:02d}")
+            rec["F"] = [float(idx) + 0.1 * gen]
+            rec["cv"] = 0.0
+            rec["status"] = "ok"
+            rec["raw"] = {"a": rec["F"][0]}
+            return r._finish_record(rec, _time.time())
+
+        r._evaluate = fake_eval
+        return r
+
+    def drain(run):
+        out = []
+        while True:
+            try:
+                out.append(run.queue.get_nowait())
+            except _queue.Empty:
+                return out
+
+    def kinds(run):
+        return [k for k, _d in drain(run)]
+
+    def wait_until(cond, timeout=15.0):
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            if cond():
+                return True
+            _time.sleep(0.02)
+        return False
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        # run, pause mid-generation (auto-save), resume, grow, stop
+        run = make("ptag", tmp / "p1")
+        run.start()
+        assert wait_until(lambda: len(run.records) >= 3), "no evaluations"
+        run.pause()
+        assert wait_until(lambda: "paused" in kinds(run)), "no paused event"
+        state_path = run.run_dir / "optimizer_state.json"
+        assert state_path.exists(), "pause did not auto-save the state"
+        run.save_state()            # deferred save request while paused
+        assert wait_until(lambda: "state_saved" in kinds(run)), \
+            "no state_saved event"
+        run.resume()
+        assert wait_until(lambda: "resumed" in kinds(run)), \
+            "no resumed event"
+        n_before = len(run.records)
+        assert wait_until(lambda: len(run.records) > n_before), \
+            "run did not continue after resume"
+        run.stop()
+        run.thread.join(15)
+        assert not run.thread.is_alive(), "worker did not stop"
+        done = [d for k, d in drain(run) if k == "done"]
+        assert done and done[-1]["reason"] == "stopped by user", done
+
+        # the stop auto-saved too; reload and resume in a new run folder
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        validate_state(state)
+        assert len(state["records"]) == len(run.records)
+        assert 0 <= state["pending_idx"] <= len(state["pending"])
+        r2 = OptimizationRun.from_state(state, tmp / "p2", "ptag_res")
+        assert len(r2.records) == len(state["records"])
+        assert r2._generation == state["generation"]
+
+        def fake2(gen, idx, values):
+            _time.sleep(0.005)
+            rec = r2._make_record(gen, idx, values,
+                                  f"ptag_res_g{gen:03d}i{idx:02d}")
+            rec["F"] = [float(idx) + 0.1 * gen]
+            rec["cv"] = 0.0
+            rec["status"] = "ok"
+            rec["raw"] = {"a": rec["F"][0]}
+            return r2._finish_record(rec, _time.time())
+
+        r2._evaluate = fake2
+        n_hist = len(r2.records)    # r2.records aliases the state list
+        r2.start()
+        assert wait_until(lambda: len(r2.records) > n_hist), \
+            "resumed run did not evaluate"
+        nxt = r2.records[n_hist]
+        assert nxt["id"] >= state["counters"]["next_id"] - 1 \
+            and nxt["gen"] >= state["generation"], \
+            (nxt["id"], nxt["gen"], state["generation"])
+        # the resumed run's csv contains the carried-over history rows
+        assert wait_until(lambda: r2._csv is not None)
+        r2.pause()
+        assert wait_until(lambda: "paused" in kinds(r2))
+        r2.stop()                   # stop while paused must wake the worker
+        r2.thread.join(15)
+        assert not r2.thread.is_alive()
+        lines = (r2.run_dir / "evaluations.csv").read_text().splitlines()
+        assert len(lines) >= n_hist + 2, \
+            f"csv missing carried rows ({len(lines)} lines, " \
+            f"{n_hist} carried)"
+        assert (r2.run_dir / "optimizer_state.json").exists()
+
+        # corrupt state files must be rejected with a message
+        for bad in ({}, {**state, "version": 99},
+                    {**state, "algorithm": "Nope"},
+                    {**state, "options": {**state["options"],
+                                          "pop_size": 2}}):
+            try:
+                validate_state(bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"validate_state accepted {bad}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("optimizer pause/state OK (pause-resume, save/load, "
+          "stop-while-paused, validation)")
+
+
+def test_ffd_morph():
+    """FFD morph cage: Bernstein basis, cage deformation behavior, and
+    the end-to-end geomTurbo build with morphing (no pyturbo needed)."""
+    import shutil
+    import numpy as np
+    from pipeline.ffd import (MARGIN_FRACTION, apply_morph, bernstein_basis,
+                              cage_box, cage_control_points, is_active)
+
+    # Bernstein basis: partition of unity, exact endpoints
+    for n in (2, 3, 4, 6):
+        t = np.linspace(-0.2, 1.2, 29)
+        B = bernstein_basis(n, t)
+        assert np.allclose(B.sum(axis=1), 1.0), n
+        assert np.isclose(B[0, 0], 1.0) and np.allclose(B[0, 1:], 0.0)
+        assert np.isclose(B[-1, -1], 1.0) and np.allclose(B[-1, :-1], 0.0)
+
+    # synthetic normalized section (LE at origin, axial chord = 1)
+    x = np.linspace(0.0, 1.0, 101)
+    cam = 0.12 * np.sin(np.pi * x)
+    thk = 0.05 * (1.0 - x) + 0.004
+    ss0 = np.column_stack([x, cam + thk / 2])
+    ps0 = np.column_stack([x, cam - thk / 2])
+
+    def morph(n, dx, dy, enabled=True):
+        flat = lambda v: [v] * (n * n) if isinstance(v, (int, float)) else v
+        return {"enabled": enabled, "n": n, "dx": flat(dx), "dy": flat(dy)}
+
+    # disabled: no-op, no cage info
+    ss, ps, cage = apply_morph(ss0, ps0, morph(4, [0.0] * 16, [0.0] * 16,
+                                              enabled=False))
+    assert cage is None and np.array_equal(ss, ss0) and np.array_equal(ps, ps0)
+    assert not is_active(None) and not is_active({"enabled": False})
+
+    # zero offsets: identical geometry, valid cage info
+    ss, ps, cage = apply_morph(ss0, ps0, morph(4, [0.0] * 16, [0.0] * 16))
+    assert np.allclose(ss, ss0) and np.allclose(ps, ps0)
+    assert np.allclose(cage["cp"], cage["cp0"])
+    box = cage_box(ss0, ps0)
+    assert np.allclose(cage_control_points(box, 4), cage["cp0"])
+    assert cage["box"][0] < 0.0 and cage["box"][2] < float(ps0[:, 1].min())
+
+    # rigid translation: all offsets equal -> the section moves as one
+    ss, ps, _c = apply_morph(ss0, ps0, morph(4, 0.05, -0.02))
+    assert np.allclose(ss, ss0 + [0.05, -0.02])
+    assert np.allclose(ps, ps0 + [0.05, -0.02])
+
+    # TE-only bump: the last cage column at the u = 1 edge moves the TE
+    # by the Bernstein weight of its u position (the blade sits inside
+    # the cage margin, so the edge column's influence blends, as in any
+    # FFD lattice); the LE (u = 0) only sees the first column
+    n = 4
+    dx = [0.0] * (n * n)
+    for j in range(n):
+        dx[(n - 1) * n + j] = 0.2
+    ss, ps, _c = apply_morph(ss0, ps0, morph(n, dx, [0.0] * (n * n)))
+    bx = cage_box(ss0, ps0)
+    u_of = lambda xq: (float(xq) - bx[0]) / (bx[1] - bx[0])
+    u_te, u_le = u_of(ss0[-1, 0]), u_of(ss0[0, 0])
+    # with only the last column offset, a point at u moves by
+    # 0.2 * B_{n-1}(u) (y offsets are zero, and the v basis sums to 1)
+    expected = 0.2 * float(bernstein_basis(n, [u_te])[0, -1])
+    assert 0.0 < expected < 0.2, expected
+    assert np.isclose(ss[-1, 0], ss0[-1, 0] + expected)
+    assert np.isclose(ps[-1, 0], ps0[-1, 0] + expected)
+    expected_le = 0.2 * float(bernstein_basis(n, [u_le])[0, -1])
+    assert np.isclose(ss[0, 0] - ss0[0, 0], expected_le)
+    assert np.isclose(ps[0, 0] - ps0[0, 0], expected_le)
+    assert expected_le < 0.005 * expected            # LE barely moves
+    i_mid = len(ss0) // 2
+    assert ss[i_mid, 0] - ss0[i_mid, 0] < expected   # TE moves the most
+
+    # inconsistent offsets are rejected with a clear message
+    try:
+        apply_morph(ss0, ps0, {"enabled": True, "n": 3,
+                               "dx": [0.0] * 16, "dy": [0.0] * 9})
+    except ValueError as e:
+        assert "n*n" in str(e), e
+    else:
+        raise AssertionError("length mismatch accepted")
+
+    # ---- end-to-end: geomTurbo build with a morphed section ----
+    from pipeline.airfoil import build_geometry
+    from pipeline.geomturbo import write_geomturbo
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        gt = write_geomturbo(tmp / "sec.geomTurbo", ss0 * 0.1, ps0 * 0.1,
+                             z=0.0, units="m")
+        base = {"airfoil": {"n_points": 121, "axial_chord": 100.0},
+                "domain": {"R1": 9.0, "R2": 9.0, "airfoil_count": 45,
+                           "x_min": -0.5, "x_max": 2.5}}
+
+        def build(m=None):
+            cfg = {**base, "airfoil_source": {
+                "type": "geomturbo", "geomturbo_file": str(gt),
+                "section": 0, "show_reference": False}}
+            if m is not None:
+                cfg["airfoil_source"]["morph"] = m
+            return build_geometry(cfg)
+
+        af0 = build(None)
+        assert af0["morph_cage"] is None
+        m = morph(4, 0.05, 0.0)
+        af1 = build(m)
+        assert af1["morph_cage"] is not None
+        assert np.allclose(af1["ss"], af0["ss"] + [0.05, 0.0])
+        assert af1["outline"].shape[1] == 2
+        assert len(af1["outline"]) == len(af1["ss"]) + len(af1["ps"]) - 2
+        # the pinned shared LE/TE points receive identical displacements
+        # (the deformation is a pure function of position) -> the section
+        # stays closed for meshing
+        assert np.allclose(af1["ss"][0], af1["ps"][0])
+        assert np.allclose(af1["ss"][-1], af1["ps"][-1])
+        # axial chord is NOT renormalized after morphing: the stretch
+        # would otherwise be designed away
+        assert np.isclose(af1["ss"][-1, 0], af0["ss"][-1, 0] + 0.05)
+
+        try:
+            build(morph(3, [0.0] * 16, [0.0] * 9))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("bad morph accepted by build_geometry")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- CaseState validation of the morph block ----
+    inputs = sorted((REPO / "cases").glob("*/input.json"))
+    if inputs:
+        from foilage_gui.state import CaseState
+        st = CaseState(inputs[0])
+        st.set("airfoil_source.type", "geomturbo")
+        st.set("airfoil_source.morph.enabled", True)
+        st.set("airfoil_source.morph.n", 3)
+        msgs = [m for _s, m in st.validate()]
+        assert any("dx" in m and "9" in m for m in msgs), msgs
+        st.set("airfoil_source.morph.dx", [0.0] * 9)
+        st.set("airfoil_source.morph.dy", [0.0] * 9)
+        msgs = [m for _s, m in st.validate()]
+        assert not any("offsets" in m for m in msgs), msgs
+    print("FFD morph OK (basis/translation/TE-bump/closure, "
+          "end-to-end geomTurbo build, validation)")
+
+
+def test_plugins():
+    """Extension plugins: manifest discovery, CLI run contract, the
+    build_geometry plugin path (with morph), and validation."""
+    import shutil
+    import numpy as np
+    from pipeline.plugins import (discover_plugins, get_plugin,
+                                  run_plugin_generator, type_choices)
+
+    # ---- shipped sample plugin is discoverable and well-formed
+    plugins = discover_plugins()
+    naca = get_plugin("naca")
+    assert naca is not None and not naca["error"], naca
+    assert naca["cli"] and Path(naca["cli"]).is_file()
+    assert [p["path"] for p in naca["parameters"]] == \
+        ["max_camber", "camber_position", "thickness", "n_points_surface"]
+    assert len(naca["groups"]) == 2
+    assert ("NACA 4-digit generator", "naca") in type_choices(plugins)
+
+    # ---- CLI contract: the script runs and returns valid sections
+    cfg = {"airfoil": {"n_points": 161, "axial_chord": 100.0},
+           "case": {"name": "plugincase"},
+           "airfoil_source": {"type": "naca", "params": {
+               "max_camber": 0.02, "camber_position": 0.4,
+               "thickness": 0.12, "n_points_surface": 1}}}
+    res = run_plugin_generator("naca", cfg)
+    assert len(res["ss"]) >= 100 and len(res["ss"]) == len(res["ps"])
+    ss = np.asarray(res["ss"])
+    ps = np.asarray(res["ps"])
+    assert abs(ss[0, 0]) < 1e-9 and abs(ss[-1, 0] - 1.0) < 1e-9
+    assert ss[:, 1].max() > ps[:, 1].max()          # cambered: SS above PS
+    # the parameter cache: an unchanged call returns the same result
+    assert run_plugin_generator("naca", cfg) is res
+    cfg2 = {**cfg, "airfoil_source": {**cfg["airfoil_source"],
+                                      "params": {**cfg["airfoil_source"]["params"],
+                                                 "thickness": 0.2}}}
+    res2 = run_plugin_generator("naca", cfg2)
+    assert np.ptp(np.asarray(res2["ss"])[:, 1]) > np.ptp(ss[:, 1])  # thicker
+
+    # ---- build_geometry plugin path, with and without the morph cage
+    from pipeline.airfoil import build_geometry
+
+    def build(morph=None, params=None):
+        src = {"type": "naca", "params": params or cfg["airfoil_source"]["params"]}
+        if morph is not None:
+            src["morph"] = morph
+        return build_geometry({**cfg, "airfoil_source": src})
+
+    af = build()
+    assert af["morph_cage"] is None and af["airfoil2d"] is None
+    assert abs(af["ss"][0, 0]) < 1e-6               # LE pinned at x = 0
+    assert af["ss"][-1, 0] > 0.99                   # axial chord = 1
+    dy = [0.0] * 16
+    m = {"enabled": True, "n": 4, "dx": [0.0] * 16, "dy": dy}
+    af_m = build(morph={**m, "dy": [0.05] * 16})
+    assert af_m["morph_cage"] is not None
+    assert np.allclose(af_m["ss"], af["ss"] + [0.0, 0.05])
+
+    # ---- broken / unknown plugins fail with clear messages
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        bad = tmp / "broken_one"
+        bad.mkdir()
+        (bad / "plugin.json").write_text('{"name": "Broken", "cli": "nope.py"}')
+        plugins = discover_plugins(tmp)
+        assert len(plugins) == 1 and plugins[0]["error"]
+        assert type_choices(plugins) == []
+        try:
+            run_plugin_generator("broken_one", cfg, extensions_dir=tmp)
+        except ValueError as e:
+            assert "cli script not found" in str(e), e
+        else:
+            raise AssertionError("broken plugin accepted")
+        try:
+            run_plugin_generator("does_not_exist", cfg, extensions_dir=tmp)
+        except ValueError as e:
+            assert "unknown geometry source plugin" in str(e), e
+        else:
+            raise AssertionError("unknown plugin accepted")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- CaseState validation of plugin sources
+    inputs = sorted((REPO / "cases").glob("*/input.json"))
+    if inputs:
+        from foilage_gui.state import CaseState
+        st = CaseState(inputs[0])
+        st.set("airfoil_source.type", "naca")
+        assert not any("plugin" in m.lower()
+                       for _s, m in st.validate())
+        st.set("airfoil_source.type", "no_such_plugin")
+        msgs = [m for _s, m in st.validate()]
+        assert any("known plugin" in m for m in msgs), msgs
+    print(f"plugins OK ({len(plugins)} discovered here; sample NACA runs, "
+          "builds, morphs, validates)")
+
+
+def test_optimizer_dvs():
+    """Source-dependent design-variable catalogs and the FFD cage
+    offset variables (list-element writing, morph auto-enable)."""
+    import shutil
+    from foilage_gui.optimizer import (DESIGN_VARS, OptimizationRun,
+                                       design_variables_for,
+                                       set_design_value)
+
+    # pyturbo keeps the classic catalog
+    assert [d["path"] for d in design_variables_for("pyturbo")] == \
+        [d["path"] for d in DESIGN_VARS]
+
+    # plugin source: manifest params + domain + cage offsets
+    dvs = design_variables_for("naca", morph_n=3)
+    by_path = {d["path"]: d for d in dvs}
+    assert "airfoil_source.params.thickness" in by_path
+    assert by_path["airfoil_source.params.thickness"]["min"] == 0.02
+    assert by_path["airfoil_source.params.thickness"]["max"] == 0.4
+    assert "domain.R1" in by_path and "domain.airfoil_count" in by_path
+    assert len([p for p in by_path if "morph.dx@" in p]) == 9
+    assert len([p for p in by_path if "morph.dy@" in p]) == 9
+    assert all(d["min"] == -0.1 and d["max"] == 0.1
+               for d in by_path.values() if "morph." in d["path"])
+    # non-numeric or unbounded plugin parameters are not offered
+    assert all("kind" not in d or d["kind"] in ("float", "int")
+               for d in dvs)
+
+    # geomturbo: no plugin params, but domain + cage
+    dvg = design_variables_for("geomturbo", morph_n=2)
+    assert not any(d["path"].startswith("airfoil_source.params")
+                   for d in dvg)
+    assert len([d for d in dvg if "@" in d["path"]]) == 8
+
+    # set_design_value addresses list elements, growing with zeros
+    cfg = {"airfoil_source": {"morph": {"enabled": False, "n": 2,
+                                        "dx": [0.0] * 4, "dy": [0.0] * 4}}}
+    set_design_value(cfg, "airfoil_source.morph.dx@2", 0.07)
+    assert cfg["airfoil_source"]["morph"]["dx"][2] == 0.07
+    set_design_value(cfg, "airfoil_source.morph.dy@9", -0.02)   # grows
+    assert cfg["airfoil_source"]["morph"]["dy"][9] == -0.02
+    set_design_value(cfg, "domain.R1", 3.5)
+    assert cfg["domain"]["R1"] == 3.5
+
+    # an eval input writer with cage DVs writes the offsets into the
+    # arrays and force-enables the morph
+    base = {"case": {"name": "x", "output_dir": "cases"},
+            "airfoil": {"n_points": 121, "axial_chord": 100.0},
+            "airfoil_source": {"type": "geomturbo",
+                               "geomturbo_file": "whatever.geomTurbo",
+                               "morph": {"enabled": False, "n": 2,
+                                         "dx": [0.0] * 4, "dy": [0.0] * 4}},
+            "domain": {"R1": 3.0, "R2": 3.0, "airfoil_count": 30}}
+    objs = [{"path": "a", "label": "a", "sense": "min"}]
+    run = OptimizationRun(base, Path(tempfile.mkdtemp()) / "w", "cwtag",
+                          objs, dvg, pop_size=4)
+    values = [3.7, 41] + [0.0, 0.0, 0.05, 0.0,   # dx: index 2 set
+                          0.0, -0.03, 0.0, 0.0]  # dy: index 1 set
+    eval_dir = run._write_eval_input(1, 0, values, "cwtag_g001i00")
+    written = json.loads((eval_dir / "input.json").read_text())
+    m = written["airfoil_source"]["morph"]
+    assert m["enabled"] is True, "morph not auto-enabled"
+    assert m["dx"][2] == 0.05 and m["dy"][1] == -0.03
+    assert written["domain"]["R1"] == 3.7
+    assert written["domain"]["airfoil_count"] == 41
+    assert written["domain"]["R2"] == written["domain"]["R1"]
+
+    import shutil as _sh
+    _sh.rmtree(REPO / "cases" / "cwtag_g001i00", ignore_errors=True)
+    _sh.rmtree(run.run_dir.parent, ignore_errors=True)
+    print(f"optimizer DVs OK (pyturbo {len(DESIGN_VARS)}, plugin+cage "
+          f"{len(dvs)}, geomturbo+cage {len(dvg)}; morph auto-enable)")
+
+
 def main():
     test_schema()
     test_state_roundtrip()
     test_validation()
     test_derived()
     test_gamma_model()
+    test_optimizer()
+    test_optimizer_pause_state()
+    test_ffd_morph()
+    test_plugins()
+    test_optimizer_dvs()
     test_geomturbo_import()
     test_geomturbo_external_samples()
     test_su2_mesh_reader()

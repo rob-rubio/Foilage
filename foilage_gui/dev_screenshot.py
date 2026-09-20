@@ -68,7 +68,7 @@ def main():
     hwnd = int(root.frame(), 16) if False else UROOT.GetParent(root.winfo_id())
     UROOT.SetWindowPos(hwnd, 0, 40, 40, 0, 0, 0x0001 | 0x0004)  # move only
 
-    names = ["geometry", "setup", "mesh", "solution"]
+    names = ["geometry", "setup", "mesh", "solution", "optimization"]
     for i, name in enumerate(names):
         app.notebook.select(i)
         if name in ("geometry", "mesh", "solution"):

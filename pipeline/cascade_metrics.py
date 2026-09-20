@@ -10,6 +10,27 @@ import math
 import numpy as np
 
 
+def _pitch_values(pitch, x):
+    """Return pitch values at x for a scalar or callable pitch profile."""
+    x = np.asarray(x, dtype=float)
+    if callable(pitch):
+        values = np.asarray(pitch(x), dtype=float)
+        return np.broadcast_to(values, x.shape)
+    return np.full(x.shape, float(pitch), dtype=float)
+
+
+def true_chord(ss, ps):
+    """True chord length in axial-chord-normalized coordinates.
+
+    The true chord is the straight-line distance between the shared LE and TE
+    points, rather than the axial projection or either surface arc length.
+    """
+    ss, ps = np.asarray(ss, dtype=float), np.asarray(ps, dtype=float)
+    le = 0.5 * (ss[0] + ps[0])
+    te = 0.5 * (ss[-1] + ps[-1])
+    return float(np.linalg.norm(te - le))
+
+
 def channel_widths(ss, ps, pitch, ss_upper):
     """Width of the blade-to-blade channel.
 
@@ -21,8 +42,12 @@ def channel_widths(ss, ps, pitch, ss_upper):
     SS point, index into ps of the nearest point).
     """
     sgn = 1.0 if ss_upper else -1.0
-    nb_ps = np.asarray(ps) + np.array([0.0, sgn * float(pitch)])
-    d = np.linalg.norm(ss[:, None, :] - nb_ps[None, :, :], axis=2)
+    ss, ps = np.asarray(ss, dtype=float), np.asarray(ps, dtype=float)
+    p_at_ss = _pitch_values(pitch, ss[:, 0])
+    shift = np.zeros((len(ss), 2), dtype=float)
+    shift[:, 1] = sgn * p_at_ss
+    nb_ps = ps[None, :, :] + shift[:, None, :]
+    d = np.linalg.norm(ss[:, None, :] - nb_ps, axis=2)
     j = np.argmin(d, axis=1)
     return d[np.arange(len(ss)), j], j
 
@@ -62,9 +87,11 @@ def throat_metrics(ss, ps, pitch, ss_upper, half=4):
     Unguided turning is the metal-angle change from the throat to the
     trailing edge: alpha_throat - alpha_exit.
     """
+    ss, ps = np.asarray(ss, dtype=float), np.asarray(ps, dtype=float)
     s_ch, _j = channel_widths(ss, ps, pitch, ss_upper)
     ki = int(np.argmin(s_ch))
     width = float(s_ch[ki])
+    pitch_throat = float(_pitch_values(pitch, [ss[ki, 0]])[0])
 
     a_throat = _surface_angle(ss, ki, half)
     a_exit = _exit_angle(ss)
@@ -72,6 +99,7 @@ def throat_metrics(ss, ps, pitch, ss_upper, half=4):
         "width": width,                    # axial-chord units
         "x_over_cax": float(ss[ki, 0]),    # throat location on the SS
         "u": float(ki) / (len(ss) - 1),
+        "pitch_throat": pitch_throat,      # axial-chord units
         "angle_throat_deg": a_throat,
         "angle_exit_deg": a_exit,
         "unguided_turning_deg": a_throat - a_exit,

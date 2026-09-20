@@ -1,0 +1,28 @@
+{
+  "id": "naca",
+  "name": "NACA 4-digit generator",
+  "description": "Example extension: generates a NACA 4-digit section from the parameters below (chord = axial chord, no stagger). Copy this folder to author your own generator - see extensions/README.md for the plugin contract.",
+  "cli": "generate_naca.py",
+  "timeout_s": 60,
+  "groups": [
+    {"title": "Camber", "params": ["max_camber", "camber_position"]},
+    {"title": "Thickness", "params": ["thickness", "n_points_surface"]}
+  ],
+  "parameters": [
+    {"path": "max_camber", "label": "Max camber m", "kind": "float",
+     "default": 0.02, "min": 0.0, "max": 0.095, "step": 0.005,
+     "slider": true, "unit": "c",
+     "tooltip": "Maximum camber as a fraction of the chord (first digit x 1/100). 0 gives a symmetric section."},
+    {"path": "camber_position", "label": "Camber position p", "kind": "float",
+     "default": 0.4, "min": 0.05, "max": 0.9, "step": 0.05,
+     "slider": true, "unit": "c",
+     "tooltip": "Chordwise position of maximum camber (second digit x 1/10)."},
+    {"path": "thickness", "label": "Thickness t", "kind": "float",
+     "default": 0.12, "min": 0.02, "max": 0.4, "step": 0.01,
+     "slider": true, "unit": "c",
+     "tooltip": "Maximum thickness as a fraction of the chord (last two digits x 1/100)."},
+    {"path": "n_points_surface", "label": "Cosine spacing exponent", "kind": "int",
+     "default": 1, "min": 1, "max": 4, "step": 1,
+     "tooltip": "Point clustering exponent near the LE (1 = plain cosine spacing)."}
+  ]
+}

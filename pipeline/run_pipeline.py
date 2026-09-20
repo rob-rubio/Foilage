@@ -23,6 +23,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 
 from airfoil import build_geometry
+from cascade_metrics import throat_metrics, true_chord
 from mesh_tris import mesh_domain, pitch_profile
 from plots import plot_airfoil, plot_tri_mesh, plot_quad_mesh
 import quadify
@@ -141,6 +142,32 @@ def main():
         f"      periodic passage: N={dom_cfg['airfoil_count']} "
         f"R1={dom_cfg['R1']} R2={dom_cfg['R2']} -> "
         f"pitch_le={prof['p_le']:.4f}, pitch_te={prof['p_te']:.4f}"
+    )
+
+    # 0D geometric metrics (axial-chord units) - copied into the SU2 case
+    # by setup_cascade_case.py and merged into results.json by plot_case.py
+    throat = throat_metrics(airfoil["ss"], airfoil["ps"], prof["p"],
+                            airfoil["ss_upper"])
+    chord_cax = true_chord(airfoil["ss"], airfoil["ps"])
+    radius_throat_cax = float(prof["radius"](throat["x_over_cax"]))
+    (case_dir / "geometry_metrics.json").write_text(json.dumps({
+        "throat_width_cax": throat["width"],
+        "throat_x_over_cax": throat["x_over_cax"],
+        "angle_throat_deg": throat["angle_throat_deg"],
+        "angle_exit_deg": throat["angle_exit_deg"],
+        "unguided_turning_deg": throat["unguided_turning_deg"],
+        "pitch_le_cax": float(prof["p_le"]),
+        "pitch_te_cax": float(prof["p_te"]),
+        "radius_throat_cax": radius_throat_cax,
+        "pitch_throat_cax": float(throat["pitch_throat"]),
+        "true_chord_cax": chord_cax,
+        "pitch_to_chord": float(throat["pitch_throat"] /
+                                  max(chord_cax, 1e-30)),
+    }, indent=2))
+    print(
+        f"      throat: width {throat['width']:.4f} c_ax at "
+        f"x/c_ax = {throat['x_over_cax']:.3f}, unguided turning "
+        f"{throat['unguided_turning_deg']:.1f} deg"
     )
 
     wake_cfg = cfg["mesh"].get("wake") or {}

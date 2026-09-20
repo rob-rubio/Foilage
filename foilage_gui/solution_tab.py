@@ -686,11 +686,29 @@ class SolutionTab(ttk.Frame):
                 lines.append(f"{plane}:")
                 lines.append(f"  mass flow  : "
                              f"{p.get('mass_flow_kg_s_m', 0):.4f} kg/(s.m)")
+                lines.append(f"  corrected  : "
+                             f"{p.get('corrected_flow_kg_s_m', 0):.4f} "
+                             f"kg/(s.m)  (W*sqrt(theta)/delta)")
                 lines.append(f"  Mach       : {p.get('mach', 0):.3f}")
                 lines.append(f"  velocity   : {p.get('velocity_m_s', 0):.1f} m/s")
                 lines.append(f"  flow angle : {p.get('flow_angle_deg', 0):+.2f} deg")
                 lines.append(f"  static p   : {p.get('static_p_pa', 0):.1f} Pa")
                 lines.append(f"  total p    : {p.get('p0_pa', 0):.1f} Pa")
+        g = r.get("geometry")
+        if g:
+            lines.append("")
+            lines.append(f"geometry (from mesh pipeline):")
+            lines.append(f"  throat width : "
+                         f"{g.get('throat_width_cax', 0):.4f} c_ax at "
+                         f"x/c_ax {g.get('throat_x_over_cax', 0):.3f}")
+            lines.append(f"  unguided turning: "
+                         f"{g.get('unguided_turning_deg', 0):+.1f} deg "
+                         f"(exit {g.get('angle_exit_deg', 0):.1f} deg)")
+            if "pitch_to_chord" in g:
+                lines.append(f"  pitch-to-chord: {g['pitch_to_chord']:.5f} "
+                             f"(pitch {g.get('pitch_throat_cax', 0):.4f} "
+                             f"c_ax / true chord {g.get('true_chord_cax', 0):.4f} "
+                             f"c_ax)")
         if "losses" in r:
             lines.append("")
             lines.append(f"total-pressure loss Yp : "

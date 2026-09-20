@@ -280,6 +280,14 @@ def main():
     (su2_dir / "mesh.su2").write_bytes(mesh_src.read_bytes())
     scale_mesh(su2_dir / "mesh.su2", scale)
 
+    # ---- 0D geometry metrics from the pipeline (throat width, unguided
+    # turning, pitch) - merged into results.json by plot_case.py
+    metrics_src = mesh_src.parent / "geometry_metrics.json"
+    if metrics_src.exists():
+        (su2_dir / "geometry_metrics.json").write_bytes(
+            metrics_src.read_bytes())
+        print(f"[metrics] geometry_metrics.json -> {su2_dir}")
+
     # ---- postprocess hints measured on this airfoil
     pts, af = parse_airfoil_mesh(su2_dir / "mesh.su2")
     p0, nrm, zoom = measure_surface_probe(pts, af)

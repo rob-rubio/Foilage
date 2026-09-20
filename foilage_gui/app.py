@@ -40,7 +40,9 @@ class FoilageApp:
         from foilage_gui.geometry_tab import GeometryTab
         from foilage_gui.mesh_tab import MeshTab
         from foilage_gui.solution_tab import SolutionTab
-        for Tab in (GeometryTab, SetupTab, MeshTab, SolutionTab):
+        from foilage_gui.optimization_tab import OptimizationTab
+        for Tab in (GeometryTab, SetupTab, MeshTab, SolutionTab,
+                    OptimizationTab):
             tab = Tab(self)
             self.notebook.add(tab, text=f" {Tab.__name__[:-3]} ")
             self._tabs.append(tab)
@@ -155,6 +157,10 @@ class FoilageApp:
         if self.job and self.job.running:
             messagebox.showinfo("Busy", "A job is already running.")
             return
+        if any(getattr(tab, "opt_running", False) for tab in self._tabs):
+            messagebox.showinfo(
+                "Busy", "An optimization is running - stop it first.")
+            return
         issues = [i for i in self.state.validate() if i[0] == "error"]
         for tab in self._tabs:                       # validate form fields
             if hasattr(tab, "fields"):
@@ -231,19 +237,31 @@ class FoilageApp:
                 except Exception:
                     break
                 if kind == "log":
+                    line = data["line"]
                     for tab in self._tabs:
                         if hasattr(tab, "log"):
-                            tab.log(data["line"])
+                            self._safe(tab, lambda t=tab: t.log(line))
                 else:
                     for tab in self._tabs:
                         if hasattr(tab, "on_job_event"):
-                            tab.on_job_event(kind, data)
+                            self._safe(tab, lambda t=tab, k=kind, d=data:
+                                       t.on_job_event(k, d))
                     if kind == "done":
                         self.set_status(f"job '{job.name}': {data['reason']}")
                         for tab in self._tabs:
                             if hasattr(tab, "_update_buttons"):
-                                tab._update_buttons()
+                                self._safe(tab, tab._update_buttons)
         self.root.after(POLL_MS, self._pump)
+
+    @staticmethod
+    def _safe(tab, call):
+        """A broken tab must not kill the pump (it would freeze the live
+        plots, the log streaming and the run/stop buttons for everyone)."""
+        try:
+            call()
+        except Exception as e:
+            print(f"[warn] {type(tab).__name__} event handler failed: {e}",
+                  file=sys.stderr)
 
     # ------------------------------------------------------------- helpers
     def _confirm_discard(self):

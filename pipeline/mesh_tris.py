@@ -20,7 +20,6 @@ Physical groups: inlet, outlet, periodic_bottom, periodic_top, airfoil, fluid.
 """
 
 import numpy as np
-import gmsh
 
 TYPE_NAMES = {1: "line", 2: "triangle", 3: "quad"}
 NSEG_PERIODIC = 60  # transfinite segments per periodic edge
@@ -82,12 +81,16 @@ def pitch_profile(dom_cfg, airfoil):
     def y_c(x):
         return np.interp(x, grid, smooth)
 
-    def p(x):
+    def radius(x):
         t = (np.asarray(x, dtype=float) - x_le) / max(x_te - x_le, 1e-30)
         t = np.clip(t, 0.0, 1.0)
-        return p_le + (p_te - p_le) * t
+        return r1 + (r2 - r1) * t
 
-    return {"p": p, "y_c": y_c, "e": lambda x: p(x) / 2.0,
+    def p(x):
+        return 2.0 * np.pi * radius(x) / N
+
+    return {"p": p, "radius": radius, "y_c": y_c,
+            "e": lambda x: p(x) / 2.0,
             "p_le": p_le, "p_te": p_te, "x_le": x_le, "x_te": x_te}
 
 
@@ -101,6 +104,7 @@ def periodic_edges(prof, x_min, x_max, n=200):
 
 def mesh_domain(airfoil, dom_cfg, mesh_cfg, prefix,
                 bl_quads=False, recombine=False):
+    import gmsh          # lazy: only the meshing stage needs it
     prof = pitch_profile(dom_cfg, airfoil)
     x0 = dom_cfg.get("x_min", -0.5)
     x1 = dom_cfg.get("x_max", 2.5)
@@ -326,6 +330,7 @@ def mesh_domain(airfoil, dom_cfg, mesh_cfg, prefix,
 
 
 def _marker_tag(name):
+    import gmsh          # lazy: only the meshing stage needs it
     for dim, tag in gmsh.model.getPhysicalGroups(1):
         if gmsh.model.getPhysicalName(dim, tag) == name:
             return tag
@@ -333,6 +338,7 @@ def _marker_tag(name):
 
 
 def _stats():
+    import gmsh          # lazy: only the meshing stage needs it
     etypes, etags, _ = gmsh.model.mesh.getElements(2)
     counts = {TYPE_NAMES.get(t, t): len(tags) for t, tags in zip(etypes, etags)}
     stats = {"counts": counts, "total": sum(counts.values())}
@@ -348,6 +354,7 @@ NNODES = {1: 2, 2: 3, 3: 4}
 
 
 def _write_obj(path):
+    import gmsh          # lazy: only the meshing stage needs it
     """Write the 2D mesh (triangles and/or quads) as a planar OBJ."""
     etypes, etags, enodes = gmsh.model.mesh.getElements(2)
     node_ids, coords, _ = gmsh.model.mesh.getNodes()

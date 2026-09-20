@@ -714,6 +714,27 @@ def write_results(case_dir, case, fs, dist=None):
         md_i = out["inlet"]["mass_flow_kg_s_m"]
         md_o = out["outlet"]["mass_flow_kg_s_m"]
         out["mass_balance"] = {"imbalance_pct": float(abs(md_i - md_o) / md_i * 100)}
+        # corrected flow W*sqrt(theta)/delta (NASA Glenn): the mass flow
+        # normalized to standard reference conditions, T0ref = 288.15 K,
+        # p0ref = 101325 Pa. theta uses the row total temperature (constant
+        # through an adiabatic stator); delta uses each plane's own
+        # mass-averaged total pressure, so the inlet value equals the
+        # BC-level corrected flow and the outlet one carries the loss.
+        T_REF, P_REF = 288.15, 101325.0
+        T01 = cascade["inlet"]["total_temperature"]
+        for name in ("inlet", "outlet"):
+            if name in out:
+                out[name]["corrected_flow_kg_s_m"] = float(
+                    out[name]["mass_flow_kg_s_m"] * np.sqrt(T01 / T_REF)
+                    / (out[name]["p0_pa"] / P_REF))
+
+    # 0D geometry metrics written by the mesh pipeline (axial-chord units)
+    metrics_path = case_dir / "geometry_metrics.json"
+    if metrics_path.exists():
+        try:
+            out["geometry"] = json.loads(metrics_path.read_text())
+        except (OSError, ValueError) as e:
+            print(f"geometry_metrics.json ignored: {e}")
 
     if dist and dist.get("summary"):
         out["back_surface_diffusion"] = {

@@ -8,41 +8,73 @@ heights) is expressed in these axial-chord units.
 """
 
 import numpy as np
-from pyturbo.aero import Airfoil2D
 
 
 def build_geometry(cfg):
-    """Dispatch on airfoil_source.type: pyturbo-aero generation (default)
-    or an imported geomTurbo section.
+    """Dispatch on airfoil_source.type: pyturbo-aero generation (default),
+    an imported geomTurbo section, or a plugin generator from the
+    extensions/ directory (the plugin's CLI is run and its section is
+    normalized exactly like a geomTurbo import).
 
-    Returns the same airfoil dict for both sources so meshing and
+    Returns the same airfoil dict for all sources so meshing and
     post-processing are source-agnostic. The dict carries the axial chord
     in actual units (mm when axial_chord >= 1, else meters) because the
     domain radii R1/R2 are also specified in actual units and must be
     normalized by it.
+
+    Imported/plugin sections may additionally carry airfoil_source.morph:
+    an FFD control cage (see pipeline/ffd.py) applied to the normalized
+    section before it is used for meshing. The returned dict then includes
+    "morph_cage" (cage box + deformed control points) for drawing.
     """
     src = cfg.get("airfoil_source") or {}
-    if src.get("type") != "geomturbo":
+    stype = src.get("type") or "pyturbo"
+    if stype == "pyturbo":
         af = build_airfoil(cfg["airfoil"])
+        af["morph_cage"] = None
     else:
         try:
             from pipeline.geomturbo import parse_geomturbo, section_to_airfoil
         except ImportError:
             from geomturbo import parse_geomturbo, section_to_airfoil
-        file_path = src.get("geomturbo_file")
-        if not file_path:
-            raise ValueError("geomTurbo source selected but "
-                             "airfoil_source.geomturbo_file is empty")
-        parsed = parse_geomturbo(file_path)
-        sections = parsed["sections"]
-        idx = int(src.get("section") or 0)
-        idx = max(0, min(idx, len(sections) - 1))
-        sec = sections[idx]
         n = int(cfg.get("airfoil", {}).get("n_points", 401))
-        af = section_to_airfoil(sec, n_points=n)
+        if stype == "geomturbo":
+            file_path = src.get("geomturbo_file")
+            if not file_path:
+                raise ValueError("geomTurbo source selected but "
+                                 "airfoil_source.geomturbo_file is empty")
+            parsed = parse_geomturbo(file_path)
+            sections = parsed["sections"]
+            idx = int(src.get("section") or 0)
+            idx = max(0, min(idx, len(sections) - 1))
+            sec = sections[idx]
+            af = section_to_airfoil(sec, n_points=n)
+            af["section_z"] = sec["z"]
+            af["blade_count"] = parsed["blade_count"]
+        else:
+            try:
+                from pipeline.plugins import run_plugin_generator
+            except ImportError:
+                from plugins import run_plugin_generator
+            result = run_plugin_generator(stype, cfg)
+            af = section_to_airfoil({"ss": result["ss"],
+                                     "ps": result["ps"]}, n_points=n)
+            af["section_z"] = None
+            af["blade_count"] = result.get("blade_count")
         af["airfoil2d"] = None
-        af["section_z"] = sec["z"]
-        af["blade_count"] = parsed["blade_count"]
+        # imported and generated-plugin sections share the morph stage
+        morph = src.get("morph")
+        if isinstance(morph, dict) and morph.get("enabled"):
+            try:
+                from pipeline.ffd import apply_morph, rebuild_outline
+            except ImportError:
+                from ffd import apply_morph, rebuild_outline
+            af["ss"], af["ps"], cage = apply_morph(af["ss"], af["ps"], morph)
+            af["outline"] = rebuild_outline(af["ss"], af["ps"],
+                                            af["ss_upper"])
+            af["morph_cage"] = cage
+        else:
+            af["morph_cage"] = None
     af["axial_chord"] = float(cfg.get("airfoil", {}).get("axial_chord")
                               or 1.0)
     return af
@@ -70,6 +102,7 @@ def build_airfoil(af_cfg):
     always shapes the aerodynamic suction side. The returned arrays satisfy
     ss = suction side, ps = pressure side, outline wound clockwise.
     """
+    from pyturbo.aero import Airfoil2D      # lazy: only the pyturbo path
     style = "cap" if (af_cfg["alpha2"] - af_cfg["alpha1"]) < 0 else "cup"
     sign = -1.0 if style == "cap" else 1.0
     af = Airfoil2D(

@@ -159,6 +159,32 @@ SECTIONS = [
                           "imported geomTurbo section in gray so the "
                           "generated blade can be matched to it manually."),
     ]),
+    Section("geometry", "geomTurbo morph (FFD cage)", [
+        FieldSpec("airfoil_source.morph.enabled", "Enable FFD morphing",
+                  "bool", False,
+                  tooltip="Apply the morph cage to the imported section "
+                          "before meshing (geomTurbo source only). The "
+                          "blade preview updates live; the deformation is "
+                          "stored in input.json so the mesh and any "
+                          "optimization runs use the same shape."),
+        FieldSpec("airfoil_source.morph.n", "Morph points per direction",
+                  "int", 4, 2, 8, step=1,
+                  tooltip="N_morph: the cage is an N_morph x N_morph grid "
+                          "of control points around the section "
+                          "(N_morph^2 points, each with a dx and dy "
+                          "offset). The cage box is derived from the "
+                          "section bounding box plus a small margin."),
+        FieldSpec("airfoil_source.morph.dx", "Cage point dx offsets",
+                  "float_array", [0.0] * 16, array_fixed=True,
+                  tooltip="x offsets of the cage control points in axial-"
+                          "chord units, row-major over the N_morph x "
+                          "N_morph grid (edited in the morph panel)."),
+        FieldSpec("airfoil_source.morph.dy", "Cage point dy offsets",
+                  "float_array", [0.0] * 16, array_fixed=True,
+                  tooltip="y offsets of the cage control points in axial-"
+                          "chord units, row-major over the N_morph x "
+                          "N_morph grid (edited in the morph panel)."),
+    ]),
     Section("geometry", "Camberline", [
         FieldSpec("airfoil.alpha1", "Inlet metal angle alpha1", "float",
                   10.0, -70.0, 70.0, slider=True, unit="deg",
@@ -333,3 +359,27 @@ for _f in FIELDS:
 
 def sections_for(tab):
     return [s for s in SECTIONS if s.tab == tab]
+
+
+def field_from_dict(data, prefix=""):
+    """Build a FieldSpec from a plugin-manifest parameter dict (see
+    pipeline/plugins.py). Unknown kinds fall back to float; 'choices'
+    entries are [label, value] pairs."""
+    path = str(data.get("path") or "").strip()
+    kind = data.get("kind") or "float"
+    if kind not in ("float", "int", "str", "bool", "choice", "float_array",
+                    "nullable_float", "nullable_int", "file"):
+        kind = "float"
+    choices = None
+    if kind == "choice":
+        choices = [(str(c[0]), c[1]) for c in (data.get("choices") or [])
+                   if isinstance(c, (list, tuple)) and len(c) >= 2]
+    return FieldSpec(path=prefix + path,
+                     label=str(data.get("label") or path or "parameter"),
+                     kind=kind, default=data.get("default"),
+                     min=data.get("min"), max=data.get("max"),
+                     step=data.get("step"), choices=choices,
+                     slider=bool(data.get("slider")),
+                     unit=str(data.get("unit") or ""),
+                     tooltip=str(data.get("tooltip") or ""),
+                     array_fixed=bool(data.get("array_fixed")))
