@@ -40,7 +40,7 @@ if str(REPO) not in sys.path:
 if str(REPO / "tools") not in sys.path:
     sys.path.insert(0, str(REPO / "tools"))
 from foilage_config import resolve_su2_executable  # noqa: E402
-from freestream import gamma_of_air  # noqa: E402
+from freestream import gamma_of_air, sutherland_mu  # noqa: E402
 
 SUPPORTED_TURBULENCE_MODELS = {"SA", "SST"}
 DEFAULT_TURBULENCE_MODEL = "SA"
@@ -52,6 +52,60 @@ DEFAULT_NUMERICS = {
     "cfl_adapt": [0.1, 1.2, 5.0, 40.0],
     "linear_solver_iter": 100,
 }
+
+
+def cascade_flow_states(p01, T01, p2, gamma, R=287.058):
+    """Return the pressure-driven outlet state and a gentle startup state.
+
+    The cascade BCs provide inlet total pressure/temperature and outlet
+    static pressure. The isentropic outlet state is a useful physical
+    reference for Reynolds number and post-processing, but using its Mach
+    number as the uniform initial velocity can inject too much mass flow into
+    a turning passage. The startup state therefore keeps the predicted
+    outlet static pressure/temperature and uses a bounded low Mach number.
+
+    ``init_pressure`` and ``init_temperature`` are static freestream values.
+    That is what SU2 expects with ``FREESTREAM_OPTION= TEMPERATURE_FS`` and
+    ``INIT_OPTION= TD_CONDITIONS``; ``MACH_NUMBER`` supplies the initial
+    velocity independently.
+    """
+    p01, T01, p2, gamma, R = map(float, (p01, T01, p2, gamma, R))
+    if p01 <= 0.0 or T01 <= 0.0 or p2 <= 0.0 or R <= 0.0:
+        raise ValueError("cascade pressures, temperature, and gas constant "
+                         "must be positive")
+    if gamma <= 1.0:
+        raise ValueError("gamma must be greater than one")
+    if p2 >= p01:
+        raise ValueError("outlet static pressure must be below inlet total pressure")
+
+    pressure_ratio = p01 / p2
+    m2_sq = 2.0 / (gamma - 1.0) * (
+        pressure_ratio ** ((gamma - 1.0) / gamma) - 1.0)
+    mach_exit = math.sqrt(max(m2_sq, 0.0))
+    t2 = T01 / (1.0 + 0.5 * (gamma - 1.0) * mach_exit ** 2)
+    a2 = math.sqrt(gamma * R * t2)
+    velocity_exit = mach_exit * a2
+    rho2 = p2 / (R * t2)
+    mu2 = sutherland_mu(t2)
+
+    # Start at the outlet pressure equilibrium, but with deliberately modest
+    # velocity. Scaling from the physical exit Mach keeps the startup flow
+    # proportional for low-pressure-ratio cases; the cap prevents an
+    # excessive first-step mass flux for high-pressure-ratio cases.
+    mach_init = min(0.20, 0.25 * mach_exit)
+    init_temperature = t2
+    init_pressure = p2
+
+    return {
+        "mach_exit": mach_exit,
+        "temperature_exit": t2,
+        "velocity_exit": velocity_exit,
+        "density_exit": rho2,
+        "viscosity_exit": mu2,
+        "mach_init": mach_init,
+        "init_temperature": init_temperature,
+        "init_pressure": init_pressure,
+    }
 
 
 def load_gamma(cfg):
@@ -263,12 +317,16 @@ def main():
 
     # ---- domain / periodic translation
     dom = cfg["domain"]
-    if abs(dom["R1"] - dom["R2"]) > 1e-9 * max(dom["R1"], dom["R2"], 1.0):
+    mode = dom.get("periodicity", "axisymmetric")
+    periodic = mode in ("axisymmetric", "offset")
+    if periodic and mode == "axisymmetric" and \
+            abs(dom["R1"] - dom["R2"]) > 1e-9 * max(dom["R1"], dom["R2"], 1.0):
         sys.exit("R1 != R2 (varying pitch) cannot be paired by SU2 - "
                  "regenerate the mesh with R1 = R2 (see the_process.md)")
     # R1/R2 are actual radii (same units as axial_chord): convert to meters
     units_to_m = 0.001 if ac >= 1.0 else 1.0
-    pitch_m = 2.0 * math.pi * dom["R1"] * units_to_m / dom["airfoil_count"]
+    pitch_m = 2.0 * math.pi * dom["R1"] * units_to_m / dom["airfoil_count"] \
+        if periodic else 0.0
 
     # ---- BCs from input.json
     p01, T01, ang, p2 = load_bc(cfg)
@@ -294,28 +352,42 @@ def main():
 
     # ---- reference / init state
     R = 287.058
-    T2 = T01 * (p2 / p01) ** ((gamma - 1) / gamma)
-    V2 = math.sqrt(2 * gamma / (gamma - 1) * R * (T01 - T2))
-    rho2 = p2 / (R * T2)
-    mu2 = 1.716e-5 * (T2 / 273.15) ** 1.5 * (383.55 / (T2 + 110.4))
-    Re = rho2 * V2 * scale / mu2
-    print(f"[refs] isentropic exit: M={V2/math.sqrt(gamma*R*T2):.3f} "
+    flow = cascade_flow_states(p01, T01, p2, gamma, R)
+    T2 = flow["temperature_exit"]
+    V2 = flow["velocity_exit"]
+    Re = flow["density_exit"] * V2 * scale / flow["viscosity_exit"]
+    print(f"[refs] isentropic exit: M={flow['mach_exit']:.3f} "
           f"V={V2:.1f} m/s | Re_axial = {Re:.3g}, pitch = {pitch_m:.6f} m")
+    print(f"[init] pressure-balanced outlet state: M={flow['mach_init']:.3f} "
+          f"p={flow['init_pressure']:.1f} Pa, "
+          f"T={flow['init_temperature']:.1f} K")
 
+    mode_desc = {
+        "axisymmetric": "Turbine vane cascade auto-setup",
+        "offset": "Linear-cascade (offset periodics) auto-setup",
+        "freestream": "Isolated-airfoil (freestream boundaries) auto-setup",
+    }.get(mode, "Turbine vane cascade auto-setup")
     case = {
         "name": su2_name,
-        "description": (f"Turbine vane cascade auto-setup from {case_root}. "
+        "description": (f"{mode_desc} from {case_root}. "
                         f"BCs and solver settings read from input.json; "
                         f"mesh scaled {scale} m/chord."),
+        "boundary_mode": "cascade" if periodic else "freestream",
         "mesh": "mesh.su2",
         "physics": {
             "solver": "RANS",
             "turbulence_model": turbulence_model,
-            "mach": 0.65,
+            # Physical reference state: the isentropic exit estimate from
+            # the supplied inlet/outlet thermodynamic conditions.
+            "mach": flow["mach_exit"],
             "reynolds": Re,
             "reynolds_length": scale,
-            "init_pressure": 100000.0,
-            "init_temperature": 660.0,
+            # Solver startup state: separate from the physical reference Mach
+            # so the initial uniform field does not over-feed the passage.
+            "freestream_temperature": T2,
+            "init_mach": flow["mach_init"],
+            "init_pressure": flow["init_pressure"],
+            "init_temperature": flow["init_temperature"],
             "gamma": gamma,
             "gas_constant": R,
         },
@@ -323,8 +395,6 @@ def main():
             "inlet": {"marker": "inlet", "total_pressure": p01,
                       "total_temperature": T01, "direction": direction},
             "outlet": {"marker": "outlet", "static_pressure": p2},
-            "periodic": [{"markers": ["periodic_bottom", "periodic_top"],
-                          "translation": [0.0, pitch_m, 0.0]}],
         },
         "markers": {
             "airfoil": {"bc": "wall_adiabatic"},
@@ -348,6 +418,19 @@ def main():
                         < float(cfg["airfoil"]["alpha1"]),
         },
     }
+    if periodic:
+        # translational periodic pair (R1 = R2 -> constant pitch in meters)
+        case["cascade"]["periodic"] = [
+            {"markers": ["periodic_bottom", "periodic_top"],
+             "translation": [0.0, pitch_m, 0.0]}]
+    else:
+        # Freestream mode: all four outer edges are farfield.  Keep the
+        # separate mesh tags so existing meshes remain usable, but do not
+        # mark the former inlet/outlet edges for cascade analysis.
+        case["markers"]["inlet"] = {"bc": "farfield"}
+        case["markers"]["outlet"] = {"bc": "farfield"}
+        case["markers"]["farfield"] = {"bc": "farfield"}
+        print("[bcs] freestream outer boundary: inlet, outlet, farfield -> MARKER_FAR")
     (su2_dir / "case.json").write_text(json.dumps(case, indent=2))
     print(f"[case] wrote {su2_dir / 'case.json'}")
 
@@ -382,7 +465,9 @@ def main():
                            cwd=str(su2_dir), capture_output=True, text=True,
                            timeout=300, creationflags=CREATE_NO_WINDOW)
         log = r.stdout + r.stderr
-        if r.returncode != 0 or "Matched" not in log:
+        # freestream cases have no periodic pair, so there is no
+        # "Matched" pairing line to look for
+        if r.returncode != 0 or (periodic and "Matched" not in log):
             sys.exit(f"validation FAILED:\n{log[-1500:]}")
         for ln in log.splitlines():
             if "Matched" in ln:

@@ -107,12 +107,6 @@ class CaseState:
     def validate(self):
         """Cross-field checks: list of (severity, message)."""
         issues = []
-        r1, r2 = self.get("domain.R1"), self.get("domain.R2")
-        if r1 is not None and r2 is not None and abs(r1 - r2) > 1e-9:
-            issues.append(("warning",
-                           f"R1 ({r1}) != R2 ({r2}): the mesh can be built, "
-                           "but SU2 needs R1 = R2 for a single-translation "
-                           "periodic pair."))
         p01 = self.get("BCs.inlet.total pressure")
         p2 = self.get("BCs.outlet.static pressure")
         if p01 is not None and p2 is not None and p2 >= p01:
@@ -184,6 +178,23 @@ class CaseState:
         x1 = self.get("domain.x_max")
         if x0 is not None and x1 is not None and x1 <= x0:
             issues.append(("error", "Domain x_max must be greater than x_min."))
+        mode = self.get("domain.periodicity") or "axisymmetric"
+        if mode == "axisymmetric":
+            # only the unwrapped annulus pairs the blades by radius
+            r1, r2 = self.get("domain.R1"), self.get("domain.R2")
+            if r1 is not None and r2 is not None and abs(r1 - r2) > 1e-9:
+                issues.append(
+                    ("warning",
+                     f"R1 ({r1}) != R2 ({r2}): the mesh can be built, but "
+                     "SU2 needs R1 = R2 for a single-translation periodic "
+                     "pair."))
+        elif mode == "freestream":
+            ylo = self.get("domain.y_min")
+            yhi = self.get("domain.y_max")
+            if ylo is not None and yhi is not None and yhi <= ylo:
+                issues.append(("error",
+                               "Freestream domain y_max must be above "
+                               "y_min."))
         fl = self.get("mesh.boundary_layer.first_layer_height")
         nlay = self.get("mesh.boundary_layer.n_layers")
         if fl and nlay and fl * ((1.25) ** nlay) > 0.05:

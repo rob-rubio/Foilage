@@ -4,12 +4,13 @@ Usage:
     python render_config.py <case.json> <template.cfg> <output.cfg>
 
 Template tokens (@TOKEN@, %%MARKER_LINES%%) are replaced from case.json:
-    @SOLVER@ @TURB_MODEL_LINE@ @MACH@ @REYNOLDS@ @REYNOLDS_LENGTH@ @GAMMA@
+    @SOLVER@ @TURB_MODEL_LINE@ @MACH@ @INIT_MACH@ @REYNOLDS@ @REYNOLDS_LENGTH@ @GAMMA@
     @GAS_CONSTANT@ @T_INF@ @P_INF@ @T0@ @P0@ @ITER@ @CONV_FIELDS@
     @CONV_MINVAL@ @CONV_STARTITER@ @CFL@ @CFL_ADAPT@ @LIMITER@ @GRADIENT@
     @LINEAR_SOLVER_ITER@ @OUTPUT_FILES@ @MESH_FILE@
 %%MARKER_LINES%% expands to MARKER_* lines grouped by boundary type, plus
-MARKER_MONITORING covering all wall-type markers.
+MARKER_MONITORING covering all wall-type markers.  A case with
+``boundary_mode == "freestream"`` maps every outer marker to MARKER_FAR.
 
 Supported marker bc types: inlet, outlet, farfield, wall_adiabatic,
 wall_isothermal (needs "temperature"), symmetry.
@@ -23,6 +24,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from freestream import fmt, state  # noqa: E402
 
 WALL_TYPES = {"wall_adiabatic", "wall_isothermal"}
+
+
+def is_freestream_case(case):
+    """Return whether the case uses an external-flow outer boundary.
+
+    ``boundary_mode`` is authoritative for newly generated cases.  The
+    marker-based fallback keeps older freestream case.json files usable: the
+    earlier generator wrote a farfield marker but had no explicit mode field.
+    """
+    mode = case.get("boundary_mode")
+    if mode == "freestream":
+        return True
+    if mode:
+        return False
+    markers = case.get("markers", {})
+    cascade = case.get("cascade", {})
+    return ("cascade" in case and not cascade.get("periodic") and
+            any(spec.get("bc") == "farfield" for spec in markers.values()))
 
 
 def marker_lines(markers, fs):
@@ -60,30 +79,53 @@ def cascade_marker_lines(case):
     """Turbomachinery BCs from case["cascade"]: MARKER_INLET (total T then
     total P per SU2 v8), MARKER_OUTLET (static p), MARKER_PERIODIC
     (12-token v8 format: marker, donor, rot center, rot angles, translation),
-    plus MARKER_MONITORING / MARKER_ANALYZE from the shared markers dict."""
+    plus MARKER_MONITORING / MARKER_ANALYZE from the shared markers dict.
+
+    Freestream cases deliberately do not emit inlet, outlet, or periodic
+    entries.  Their complete outer boundary (including mesh tags named
+    ``inlet`` and ``outlet``) is one SU2 farfield boundary.
+    """
     cas = case["cascade"]
+    freestream = is_freestream_case(case)
     lines = []
 
     def nums(vals):
         return ", ".join(fmt(v) for v in vals)
 
     inl = cas["inlet"]
-    d = inl["direction"]
-    lines.append(f"MARKER_INLET= ( {inl['marker']}, {fmt(inl['total_temperature'])}, "
-                 f"{fmt(inl['total_pressure'])}, {nums(d)} )")
     out = cas["outlet"]
-    lines.append(f"MARKER_OUTLET= ( {out['marker']}, {fmt(out['static_pressure'])} )")
-    for pair in cas.get("periodic", []):
-        a, b = pair["markers"]
-        zero3 = "0.0, 0.0, 0.0"
-        # full precision: the periodic pairing tolerance is far tighter than fmt()
-        trans = ", ".join(repr(float(v)) for v in pair["translation"])
-        lines.append(f"MARKER_PERIODIC= ( {a}, {b}, {zero3}, {zero3}, {trans} )")
+    if not freestream:
+        d = inl["direction"]
+        lines.append(f"MARKER_INLET= ( {inl['marker']}, {fmt(inl['total_temperature'])}, "
+                     f"{fmt(inl['total_pressure'])}, {nums(d)} )")
+        lines.append(f"MARKER_OUTLET= ( {out['marker']}, {fmt(out['static_pressure'])} )")
+        for pair in cas.get("periodic", []):
+            a, b = pair["markers"]
+            zero3 = "0.0, 0.0, 0.0"
+            # full precision: the periodic pairing tolerance is far tighter than fmt()
+            trans = ", ".join(repr(float(v)) for v in pair["translation"])
+            lines.append(f"MARKER_PERIODIC= ( {a}, {b}, {zero3}, {zero3}, {trans} )")
 
     markers = case.get("markers", {})
     for name, spec in markers.items():
         if spec["bc"] in WALL_TYPES:
             lines.append(f"MARKER_HEATFLUX= ( {name}, 0.0 )")
+    # In external flow, every edge around the fluid domain is farfield.  The
+    # mesh retains separate names for the former inlet/outlet edges so that
+    # old meshes remain usable, but SU2 must receive one complete MARKER_FAR
+    # definition rather than a pressure-driven inlet/outlet pair.
+    if freestream:
+        farfields = []
+        for name in (inl["marker"], out["marker"]):
+            if name not in farfields:
+                farfields.append(name)
+        for name, spec in markers.items():
+            if spec["bc"] == "farfield" and name not in farfields:
+                farfields.append(name)
+    else:
+        farfields = [n for n, s in markers.items() if s["bc"] == "farfield"]
+    if farfields:
+        lines.append("MARKER_FAR= ( " + ", ".join(farfields) + " )")
     walls = [n for n, s in markers.items() if s["bc"] in WALL_TYPES]
     if walls:
         lines.append("MARKER_MONITORING= ( " + ", ".join(walls) + " )")
@@ -128,6 +170,12 @@ def main():
                             if physics.get("turbulence_model") else ""),
         "TIME_DOMAIN_BLOCK": time_domain_block(case.get("unsteady"), conv),
         "MACH": fmt(physics["mach"]),
+        "INIT_MACH": fmt(physics.get("init_mach", physics["mach"])),
+        # For a farfield boundary SU2 uses MACH_NUMBER as part of the
+        # physical free-stream definition, so the reduced cascade startup
+        # Mach cannot be used in external-flow mode.
+        "FLOW_MACH": fmt(physics["mach"] if is_freestream_case(case)
+                          else physics.get("init_mach", physics["mach"])),
         "REYNOLDS": fmt(physics["reynolds"]),
         "REYNOLDS_LENGTH": fmt(physics.get("reynolds_length", 1.0)),
         "GAMMA": fmt(physics.get("gamma", 1.4)),

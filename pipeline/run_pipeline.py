@@ -23,7 +23,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 
 from airfoil import build_geometry
-from cascade_metrics import throat_metrics, true_chord
+from cascade_metrics import (metal_angles, throat_metrics, true_chord,
+                             zweifel_geometric)
 from mesh_tris import mesh_domain, pitch_profile
 from plots import plot_airfoil, plot_tri_mesh, plot_quad_mesh
 import quadify
@@ -138,37 +139,57 @@ def main():
 
     dom_cfg = cfg.get("domain", {})
     prof = pitch_profile(dom_cfg, airfoil)
-    print(
-        f"      periodic passage: N={dom_cfg['airfoil_count']} "
-        f"R1={dom_cfg['R1']} R2={dom_cfg['R2']} -> "
-        f"pitch_le={prof['p_le']:.4f}, pitch_te={prof['p_te']:.4f}"
-    )
+    mode = prof.get("mode", "axisymmetric")
+    if mode == "freestream":
+        print("      freestream domain: no periodics, far-field "
+              f"boundaries at y = {prof.get('y_min', -1.5):.3f} / "
+              f"{prof.get('y_max', 1.5):.3f}")
+    else:
+        print(
+            f"      periodic passage ({mode}): N={dom_cfg['airfoil_count']} "
+            f"R1={dom_cfg['R1']} R2={dom_cfg['R2']} -> "
+            f"pitch_le={prof['p_le']:.4f}, pitch_te={prof['p_te']:.4f}"
+        )
 
     # 0D geometric metrics (axial-chord units) - copied into the SU2 case
     # by setup_cascade_case.py and merged into results.json by plot_case.py
-    throat = throat_metrics(airfoil["ss"], airfoil["ps"], prof["p"],
-                            airfoil["ss_upper"])
-    chord_cax = true_chord(airfoil["ss"], airfoil["ps"])
-    radius_throat_cax = float(prof["radius"](throat["x_over_cax"]))
-    (case_dir / "geometry_metrics.json").write_text(json.dumps({
-        "throat_width_cax": throat["width"],
-        "throat_x_over_cax": throat["x_over_cax"],
-        "angle_throat_deg": throat["angle_throat_deg"],
-        "angle_exit_deg": throat["angle_exit_deg"],
-        "unguided_turning_deg": throat["unguided_turning_deg"],
+    metrics = {
+        "periodicity": mode,
         "pitch_le_cax": float(prof["p_le"]),
         "pitch_te_cax": float(prof["p_te"]),
-        "radius_throat_cax": radius_throat_cax,
-        "pitch_throat_cax": float(throat["pitch_throat"]),
-        "true_chord_cax": chord_cax,
-        "pitch_to_chord": float(throat["pitch_throat"] /
-                                  max(chord_cax, 1e-30)),
-    }, indent=2))
-    print(
-        f"      throat: width {throat['width']:.4f} c_ax at "
-        f"x/c_ax = {throat['x_over_cax']:.3f}, unguided turning "
-        f"{throat['unguided_turning_deg']:.1f} deg"
-    )
+        "true_chord_cax": true_chord(airfoil["ss"], airfoil["ps"]),
+    }
+    if mode != "freestream":
+        # cascade-only: the throat lives in the channel to the
+        # pitch-translated neighbor, which a freestream domain has none of
+        throat = throat_metrics(airfoil["ss"], airfoil["ps"], prof["p"],
+                                airfoil["ss_upper"])
+        # geometric Zweifel predictor: metal angles from the section
+        # tangents stand in for the flow angles of the classic criterion
+        a1g, a2g = metal_angles(airfoil["ss"], airfoil["ps"])
+        metrics.update({
+            "throat_width_cax": throat["width"],
+            "throat_x_over_cax": throat["x_over_cax"],
+            "angle_throat_deg": throat["angle_throat_deg"],
+            "angle_exit_deg": throat["angle_exit_deg"],
+            "unguided_turning_deg": throat["unguided_turning_deg"],
+            "radius_throat_cax": float(prof["radius"](throat["x_over_cax"])),
+            "pitch_throat_cax": float(throat["pitch_throat"]),
+            "pitch_to_chord": float(throat["pitch_throat"] /
+                                    max(metrics["true_chord_cax"], 1e-30)),
+            "angle_metal_inlet_deg": a1g,
+            "angle_metal_exit_deg": a2g,
+            "zweifel_geometric": zweifel_geometric(
+                float(throat["pitch_throat"]), a1g, a2g),
+        })
+        print(
+            f"      throat: width {throat['width']:.4f} c_ax at "
+            f"x/c_ax = {throat['x_over_cax']:.3f}, unguided turning "
+            f"{throat['unguided_turning_deg']:.1f} deg, geometric Zweifel "
+            f"{metrics['zweifel_geometric']:.3f}"
+        )
+    (case_dir / "geometry_metrics.json").write_text(json.dumps(
+        metrics, indent=2))
 
     wake_cfg = cfg["mesh"].get("wake") or {}
     print(
@@ -195,10 +216,12 @@ def main():
           f"{qstats['min_corner_angle_deg']:.2f} deg")
     print(
         f"      periodic: exact 1:1 node pairing on the periodic edges, "
-        f"mismatch {stats.get('periodic_tri_max_mismatch', float('nan')):.2e}"
+        f"mismatch {stats.get('periodic_tri_max_mismatch', 0.0):.2e}"
+        if stats.get("periodic_tri_max_mismatch") is not None else
+        "      freestream: no periodic edges (far-field top/bottom)"
     )
 
-    print(f"      markers: { {m: qstats[m] for m in quadify.MARKERS} }")
+    print(f"      markers: {qstats['markers']}")
     if stats.get("wake_metal_angle_deg") is not None:
         print(f"      wake band oriented at TE metal angle: "
               f"{stats['wake_metal_angle_deg']:.2f} deg")

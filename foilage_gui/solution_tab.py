@@ -121,9 +121,9 @@ class SolutionTab(ttk.Frame):
         ttk.Label(viewer_bar, text="view:").pack(side="left", padx=(4, 2))
         self.mode_var = tk.StringVar(value="contour")
         self.mode_box = ttk.Combobox(viewer_bar, textvariable=self.mode_var,
-                                     state="readonly", width=10,
+                                     state="readonly", width=12,
                                      values=("contour", "1D surface",
-                                             "streamlines"))
+                                             "streamlines", "convergence"))
         self.mode_box.pack(side="left")
         self.mode_box.bind("<<ComboboxSelected>>",
                            lambda _e: self._mode_changed())
@@ -292,6 +292,11 @@ class SolutionTab(ttk.Frame):
 
     def _sync_quantity_choices(self):
         """Fill the quantity dropdown for the active view mode."""
+        if self.mode_var.get() == "convergence":
+            # the convergence grid has no per-field quantity
+            self.field_box.configure(state="disabled")
+            return
+        self.field_box.configure(state="readonly")
         if self.mode_var.get() == "1D surface":
             values = [q[0] for q in SURFACE_QUANTITIES]
         else:
@@ -304,7 +309,13 @@ class SolutionTab(ttk.Frame):
                 self.field_var.set("Mach" if "Mach" in values else values[0])
 
     def draw_current(self):
+        if self.mode_var.get() == "convergence":
+            self.show_convergence()
+            return
         if self._volume is None:
+            # no volume yet: draw_field's guard shows a placeholder while
+            # still switching the canvas away from any live/convergence grid
+            self.draw_field()
             return
         if self.mode_var.get() == "1D surface":
             self.draw_surface()
@@ -316,15 +327,21 @@ class SolutionTab(ttk.Frame):
     # ------------------------------------------------------------- viewer
     def draw_field(self):
         name = self.field_var.get()
+        # switch the canvas first: a mode change must never leave the
+        # live-convergence grid on screen when no volume is loaded
+        self._enter_field_view()
         if not name or name not in self._fields:
+            self.ax.text(0.5, 0.5, "no volume field loaded - run the solver "
+                         "or import a .vtk",
+                         transform=self.ax.transAxes, ha="center",
+                         fontsize=9, color="0.4")
+            self.fig.tight_layout()
+            self.canvas.draw_idle()
             return
         values, cmap = self._fields[name]
         pts, conn = volume_triangulation(self._volume)
         pitch = self._periodic_pitch()
         shifts = (-pitch, 0.0, pitch) if pitch else (0.0,)
-        # full rebuild: guarantees the field owns the whole canvas and no
-        # live-convergence axes or stale colorbars survive
-        self._enter_field_view()
         ax = self.ax
         tc = None
         for dy in shifts:
@@ -577,7 +594,7 @@ class SolutionTab(ttk.Frame):
         try:
             from foilage_gui.su2_mesh import read_su2_mesh
             m = read_su2_mesh(mesh_path)
-            for name in ("periodic_bottom", "periodic_top"):
+            for name in ("periodic_bottom", "periodic_top", "farfield"):
                 if name in m["markers"]:
                     e = m["markers"][name]
                     coords = m["points"][e[:, 0]]      # first node per edge
@@ -713,6 +730,15 @@ class SolutionTab(ttk.Frame):
             lines.append("")
             lines.append(f"total-pressure loss Yp : "
                          f"{r['losses'].get('total_pressure_loss_coeff_Yp', 0):.4f}")
+        zw = r.get("zweifel")
+        if zw:
+            lines.append(f"Zweifel incompressible : "
+                         f"{zw.get('incompressible', 0):.4f}")
+            lines.append(f"Zweifel compressible   : "
+                         f"{zw.get('compressible', 0):.4f}   "
+                         f"(s/bx {zw.get('pitch_over_axial_chord', 0):.3f}, "
+                         f"a1 {zw.get('alpha1_deg', 0):+.1f} deg -> "
+                         f"a2 {zw.get('alpha2_deg', 0):+.1f} deg)")
         bsd = r.get("back_surface_diffusion")
         if bsd:
             ss_df = bsd.get("ss", {}).get("DF", 0)
@@ -766,11 +792,59 @@ class SolutionTab(ttk.Frame):
         if self._job_solving and self._live_tail:
             self._live_tail.poll()
             self._draw_live()
+        elif self.mode_var.get() == "convergence":
+            # static convergence view: refresh when history.csv changes
+            # (e.g. a solve started outside the GUI)
+            hist = self.app.state.case_dir() / "history.csv"
+            try:
+                mtime = hist.stat().st_mtime
+            except OSError:
+                mtime = None
+            if mtime is not None and mtime != getattr(self, "_conv_mtime",
+                                                      None):
+                self.show_convergence()
         self.after(LIVE_POLL_MS, self._poll_live)
 
     def _draw_live(self):
-        tail = self._live_tail
-        kind, total = self._live_cfg
+        total = self._live_cfg[1] if self._live_cfg else None
+        self._render_convergence(self._live_tail, total,
+                                 "solver running - live convergence")
+
+    def show_convergence(self):
+        """The 'convergence' view mode: the exact same 2x2 grid the
+        solver's live view shows, rendered from the case's history.csv.
+        While a solve is running it keeps live-tailing the file."""
+        if self._job_solving and self._live_tail:
+            self._draw_live()
+            return
+        case_dir = self.app.state.case_dir()
+        hist = case_dir / "history.csv"
+        self._enter_live_view()
+        if not hist.exists():
+            ax_res, ax_f, ax_m, ax_b = self._live_axes
+            for ax in self._live_axes:
+                ax.clear()
+                ax.grid(True, alpha=0.3)
+            ax_res.text(0.5, 0.5, f"no history.csv in {case_dir}",
+                        transform=ax_res.transAxes, ha="center",
+                        fontsize=8, color="0.4")
+            self.fig.tight_layout()
+            self.canvas.draw_idle()
+            self._conv_mtime = None
+            return
+        tail = HistoryTail(hist)
+        tail.poll()
+        self._conv_mtime = hist.stat().st_mtime
+        cfg_path = case_dir / "turbine.cfg"
+        total = None
+        if cfg_path.exists():
+            try:
+                total = parse_cfg_totals(cfg_path)[1]
+            except Exception:
+                total = None
+        self._render_convergence(tail, total, "convergence (history.csv)")
+
+    def _render_convergence(self, tail, total, status_prefix):
         xcol = "Time_Iter" if (tail.get("Time_Iter")
                                and max(tail.get("Time_Iter")) > 0) \
             else ("Inner_Iter" if "Inner_Iter" in (tail.columns or [])
@@ -786,18 +860,23 @@ class SolutionTab(ttk.Frame):
             ax_res.text(0.5, 0.5,
                         f"waiting for history.csv ... ({tail.rows} rows)",
                         transform=ax_res.transAxes, ha="center")
-            self.status_var.set("solver running - waiting for history.csv")
+            self.status_var.set(f"{status_prefix} - waiting for history.csv")
             self.fig.tight_layout()
             self.canvas.draw_idle()
             return
 
         x = np.asarray(x)
         self._panel_residuals(ax_res, tail, x)
-        self._panel_forces(ax_f, tail, x)
+        if self._live_is_freestream():
+            self._panel_forces(ax_f, tail, x)
+        else:
+            # periodic cascade: the meaningful "force" is the total-
+            # pressure loss, not CL/CD (those belong to freestream cases)
+            self._panel_yloss(ax_f, tail, x)
         self._panel_massflow(ax_m, tail, x)
         self._panel_imbalance(ax_b, tail, x)
         extra = f"   iter {x[-1]}/{total}" if total else f"   iter {x[-1]}"
-        self.status_var.set(f"solver running - live convergence{extra}")
+        self.status_var.set(f"{status_prefix}{extra}")
         self.fig.tight_layout()
         self.canvas.draw_idle()
 
@@ -815,6 +894,12 @@ class SolutionTab(ttk.Frame):
         if plotted:
             ax.legend(fontsize=6, ncol=2, loc="upper right")
 
+    def _live_is_freestream(self):
+        """CL/CD are only meaningful without periodics (isolated airfoil);
+        periodic cascade cases monitor the total-pressure loss instead."""
+        return (self.app.state.get("domain.periodicity")
+                or "axisymmetric") == "freestream"
+
     @staticmethod
     def _panel_forces(ax, tail, x):
         ax.clear()
@@ -827,6 +912,34 @@ class SolutionTab(ttk.Frame):
         ax.grid(True, alpha=0.3)
         if cd or cl:
             ax.legend(fontsize=6, loc="upper right")
+
+    def _panel_yloss(self, ax, tail, x):
+        """Total-pressure loss coefficient convergence for periodic
+        cascade cases: Yp = (p01 - p02) / (p01 - p2), with p02 the
+        mass-averaged outlet total pressure from the per-surface
+        history columns and p01/p2 the case boundary conditions."""
+        ax.clear()
+        ax.set_title("total-pressure loss Yp", fontsize=9, loc="left")
+        ax.grid(True, alpha=0.3)
+        ax.axhline(0.0, color="k", ls=":", lw=0.8)
+        p02 = tail.get("Avg_TotalPress(outlet)")
+        if not p02:
+            ax.text(0.5, 0.5,
+                    "no Avg_TotalPress(outlet) column\n(re-run case setup)",
+                    transform=ax.transAxes, ha="center", fontsize=7,
+                    color="0.4")
+            return
+        p01 = self.app.state.get("BCs.inlet.total pressure")
+        p2 = self.app.state.get("BCs.outlet.static pressure")
+        if not p01 or not p2 or p01 <= p2:
+            ax.text(0.5, 0.5, "inlet total / outlet static pressure\n"
+                    "not set in the Setup tab",
+                    transform=ax.transAxes, ha="center", fontsize=7,
+                    color="0.4")
+            return
+        yp = [(p01 - v) / (p01 - p2) for v in p02]
+        ax.plot(x, yp, lw=1.2, color="tab:red", label="Yp")
+        ax.legend(fontsize=6, loc="upper right")
 
     def _panel_massflow(self, ax, tail, x):
         """Mass flow at inlet and outlet (per-surface history columns)."""

@@ -1,45 +1,65 @@
-"""Gmsh stage: periodic cascade domain, boundary layers, all-triangle mesh.
+"""Gmsh stage: periodic cascade / freestream domain, boundary layers,
+all-triangle mesh.
 
-Domain (unwrapped annular cascade sector, axial chord = 1, LE at origin):
+``domain.periodicity`` selects the domain (see pipeline/unwrap.py):
 
-    pitch at LE      p_le = 2*pi*R1 / N   (R1 = annulus radius at LE,
-                                           N = airfoil count)
-    pitch at TE      p_te = 2*pi*R2 / N
-    between LE/TE    pitch interpolated linearly in x
-    fore of LE / aft of TE   pitch held constant
+    axisymmetric  - unwrapped annular cascade sector: pitch varies with
+                    the annulus radius, p(x) = 2 pi R(x) / N (R linearly
+                    interpolated R1 -> R2 over the blade, constant
+                    fore/aft). Top/bottom are a translation-periodic pair.
+    offset        - linear cascade: constant pitch p = 2 pi R1 / N and
+                    straight periodic lines through y = 0 -/+ p/2 (no
+                    tangential offset); y is Cartesian.
+    freestream    - no periodics: the upper/lower boundaries are
+                    far-field lines at domain.y_min / domain.y_max
+                    (isolated airfoil calculations).
 
-The blade sits in the middle of the passage; the two domain edges are the
-passage medial axes  y = y_c(x) -/+ p(x)/2  (y_c = blade circumferential
-centerline from the outline, held constant fore of LE / aft of TE). The top
-edge is the bottom edge offset by the local pitch, so both are tagged as the
-periodic pair. Each periodic edge is built from short transfinite segments
-sharing the same x-stations on both edges, which keeps the periodic node
-correspondence tight (verified and reported downstream).
+The blade sits in the middle of the passage; in the periodic modes the
+two domain edges are the passage medial axes  y = y_c(x) -/+ p(x)/2
+(y_c = blade circumferential centerline from the outline, held constant
+fore of LE / aft of TE; identically 0 in offset mode). The top edge is
+the bottom edge offset by the local pitch, so both are tagged as the
+periodic pair. Each periodic edge is built from short transfinite
+segments sharing the same x-stations on both edges, which keeps the
+periodic node correspondence tight (verified and reported downstream).
 
-Physical groups: inlet, outlet, periodic_bottom, periodic_top, airfoil, fluid.
+Physical groups: inlet, outlet, periodic_bottom + periodic_top
+(axisymmetric / offset) or farfield (freestream), airfoil, fluid.
 """
 
 import numpy as np
+
+try:
+    from unwrap import periodicity_of
+except ImportError:                                  # package-style import
+    from pipeline.unwrap import periodicity_of
 
 TYPE_NAMES = {1: "line", 2: "triangle", 3: "quad"}
 NSEG_PERIODIC = 60  # transfinite segments per periodic edge
 
 
 def pitch_profile(dom_cfg, airfoil):
-    """Pitch p(x) and blade centerline y_c(x); p fixed fore of LE / aft of TE.
+    """Pitch p(x), radius R(x) and blade centerline y_c(x) per the
+    selected periodicity mode.
 
     ``domain.R1`` / ``domain.R2`` are the annulus radii at the LE/TE in
     *actual units* (the same units as ``airfoil.axial_chord``, e.g. mm).
-    They are normalized by the axial chord here so the passage is built in
-    normalized coordinates (blade axial chord = 1).
-    """
+    They are normalized by the axial chord here so the passage is built
+    in normalized coordinates (blade axial chord = 1). In offset mode
+    R2 is ignored (constant pitch through R1) and the centerline is
+    straight; in freestream mode the pitch values are unused and the
+    domain extends to domain.y_min / domain.y_max instead."""
+    mode = periodicity_of(dom_cfg)
     N = float(dom_cfg["airfoil_count"])
     ac = float(airfoil.get("axial_chord") or 0.0)
     r1 = float(dom_cfg["R1"])
-    r2 = float(dom_cfg["R2"])
+    r2 = float(dom_cfg.get("R2", dom_cfg["R1"]))
     if ac > 0:                       # actual units -> normalized
         r1 /= ac
         r2 /= ac
+    if mode == "offset":
+        r2 = r1                      # no tangential offset: constant pitch
+
     p_le = 2.0 * np.pi * r1 / N
     p_te = 2.0 * np.pi * r2 / N
 
@@ -62,7 +82,12 @@ def pitch_profile(dom_cfg, airfoil):
     y_mid = 0.5 * (_surf_interp(ss) + _surf_interp(ps))
     if len(y_mid) > 5:  # smooth outline discretization noise
         kernel = np.ones(5) / 5.0
-        y_mid = np.convolve(np.pad(y_mid, 2, mode="edge"), kernel, mode="valid")
+        y_mid = np.convolve(np.pad(y_mid, 2, mode="edge"), kernel,
+                            mode="valid")
+    if mode != "axisymmetric":
+        # offset / freestream: no tangential offset, y is Cartesian and
+        # the domain is centered on the blade row (y_c identically 0)
+        y_mid = np.zeros_like(y_mid)
 
     # assemble the centerline over the whole domain (constant asymptotes fore
     # of the LE / aft of the TE) and smooth it with a ~0.3-chord moving
@@ -89,14 +114,25 @@ def pitch_profile(dom_cfg, airfoil):
     def p(x):
         return 2.0 * np.pi * radius(x) / N
 
-    return {"p": p, "radius": radius, "y_c": y_c,
+    prof = {"p": p, "radius": radius, "y_c": y_c,
             "e": lambda x: p(x) / 2.0,
-            "p_le": p_le, "p_te": p_te, "x_le": x_le, "x_te": x_te}
+            "p_le": p_le, "p_te": p_te, "x_le": x_le, "x_te": x_te,
+            "mode": mode, "periodic": mode != "freestream"}
+    if mode == "freestream":
+        prof["y_min"] = float(dom_cfg.get("y_min", -1.5))
+        prof["y_max"] = float(dom_cfg.get("y_max", 1.5))
+    return prof
 
 
 def periodic_edges(prof, x_min, x_max, n=200):
-    """Sample points of the bottom/top periodic (medial axis) edges."""
+    """Sample points of the bottom/top domain boundary lines: the
+    periodic (medial axis) edges in the periodic modes, or the straight
+    far-field boundaries of the freestream box."""
     xs = np.linspace(x_min, x_max, n)
+    if not prof.get("periodic", True):
+        lo = np.full(n, float(prof.get("y_min", -1.5)))
+        hi = np.full(n, float(prof.get("y_max", 1.5)))
+        return np.column_stack([xs, lo]), np.column_stack([xs, hi])
     e = np.asarray(prof["e"](xs))
     yc = np.asarray(prof["y_c"](xs))
     return np.column_stack([xs, yc - e]), np.column_stack([xs, yc + e])
@@ -144,14 +180,23 @@ def mesh_domain(airfoil, dom_cfg, mesh_cfg, prefix,
     # per segment keep node x-positions aligned between the two edges.
     # Segment count: explicit mesh.periodic_segments (integer), else derived
     # from mesh.periodic_size (target x-spacing, chord units), else 60.
-    nseg = int(mesh_cfg.get("periodic_segments", 0) or 0)
-    if nseg <= 0:
-        psize = float(mesh_cfg.get("periodic_size", 0.0) or 0.0)
-        nseg = int(np.ceil((x1 - x0) / psize)) if psize > 0.0 else NSEG_PERIODIC
-    nseg = max(nseg, 1)
-    stations = np.linspace(x0, x1, nseg + 1)
-    bot_pts = [(prof["y_c"](x) - float(prof["e"](x))) for x in stations]
-    top_pts = [(prof["y_c"](x) + float(prof["e"](x))) for x in stations]
+    periodic = prof.get("periodic", True)
+    if periodic:
+        nseg = int(mesh_cfg.get("periodic_segments", 0) or 0)
+        if nseg <= 0:
+            psize = float(mesh_cfg.get("periodic_size", 0.0) or 0.0)
+            nseg = int(np.ceil((x1 - x0) / psize)) if psize > 0.0 else NSEG_PERIODIC
+        nseg = max(nseg, 1)
+        bot_y = lambda x: prof["y_c"](x) - float(prof["e"](x))
+        top_y = lambda x: prof["y_c"](x) + float(prof["e"](x))
+    else:
+        # freestream box: two straight segments per far-field boundary
+        stations3 = np.linspace(x0, x1, 3)
+        bot_y = lambda x: prof.get("y_min", -1.5)
+        top_y = lambda x: prof.get("y_max", 1.5)
+    stations = np.linspace(x0, x1, (nseg if periodic else 2) + 1)
+    bot_pts = [bot_y(x) for x in stations]
+    top_pts = [top_y(x) for x in stations]
 
     bot_lines, top_lines = [], []
     prev_b = geo.addPoint(stations[0], bot_pts[0], 0)
@@ -164,8 +209,9 @@ def mesh_domain(airfoil, dom_cfg, mesh_cfg, prefix,
         top_lines.append(geo.addLine(prev_t, t))
         prev_b, prev_t = b, t
     b_last, t_last = prev_b, prev_t
-    for ln in bot_lines + top_lines:
-        geo.mesh.setTransfiniteCurve(ln, 2)  # 1 element per segment
+    if periodic:
+        for ln in bot_lines + top_lines:
+            geo.mesh.setTransfiniteCurve(ln, 2)  # 1 element per segment
 
     # inlet (x = x0) and outlet (x = x1) closures; loop order: up the inlet,
     # +x along the top periodic edge, down the outlet, -x along the bottom
@@ -183,8 +229,12 @@ def mesh_domain(airfoil, dom_cfg, mesh_cfg, prefix,
     gmsh.model.addPhysicalGroup(1, [c_ss, c_ps], name="airfoil")
     gmsh.model.addPhysicalGroup(1, [c_in], name="inlet")
     gmsh.model.addPhysicalGroup(1, [c_out], name="outlet")
-    gmsh.model.addPhysicalGroup(1, bot_lines, name="periodic_bottom")
-    gmsh.model.addPhysicalGroup(1, top_lines, name="periodic_top")
+    if periodic:
+        gmsh.model.addPhysicalGroup(1, bot_lines, name="periodic_bottom")
+        gmsh.model.addPhysicalGroup(1, top_lines, name="periodic_top")
+    else:
+        gmsh.model.addPhysicalGroup(1, bot_lines + top_lines,
+                                    name="farfield")
 
     # ---- size fields ----
     h_far = mesh_cfg.get("max_size", 0.3)
@@ -303,22 +353,23 @@ def mesh_domain(airfoil, dom_cfg, mesh_cfg, prefix,
 
     # verify periodic node correspondence on the tri mesh: both periodic
     # edges were built from the same x-stations, so the match must be exact
-    bot_tag = _marker_tag("periodic_bottom")
-    top_tag = _marker_tag("periodic_top")
-    bn, bc, _ = gmsh.model.mesh.getNodes(1, bot_tag, includeBoundary=True)
-    tn, tc, _ = gmsh.model.mesh.getNodes(1, top_tag, includeBoundary=True)
-    bc = bc.reshape(-1, 3)
-    tc = tc.reshape(-1, 3)
-    bo = np.argsort(bc[:, 0])
-    to = np.argsort(tc[:, 0])
-    if len(bn) == len(tn):
-        dx = np.abs(bc[bo, 0] - tc[to, 0])
-        dy = np.abs(tc[to, 1] - bc[bo, 1])
-        p_st = prof["p"](bc[bo, 0])
-        stats["periodic_tri_max_mismatch"] = float(
-            np.max(np.hypot(dx, dy - p_st)))
-    else:
-        stats["periodic_tri_max_mismatch"] = float("inf")
+    if periodic:
+        bot_tag = _marker_tag("periodic_bottom")
+        top_tag = _marker_tag("periodic_top")
+        bn, bc, _ = gmsh.model.mesh.getNodes(1, bot_tag, includeBoundary=True)
+        tn, tc, _ = gmsh.model.mesh.getNodes(1, top_tag, includeBoundary=True)
+        bc = bc.reshape(-1, 3)
+        tc = tc.reshape(-1, 3)
+        bo = np.argsort(bc[:, 0])
+        to = np.argsort(tc[:, 0])
+        if len(bn) == len(tn):
+            dx = np.abs(bc[bo, 0] - tc[to, 0])
+            dy = np.abs(tc[to, 1] - bc[bo, 1])
+            p_st = prof["p"](bc[bo, 0])
+            stats["periodic_tri_max_mismatch"] = float(
+                np.max(np.hypot(dx, dy - p_st)))
+        else:
+            stats["periodic_tri_max_mismatch"] = float("inf")
 
     gmsh.option.setNumber("Mesh.MshFileVersion", 4.1)
     gmsh.write(str(prefix) + ".msh")

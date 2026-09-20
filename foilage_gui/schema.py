@@ -246,6 +246,24 @@ SECTIONS = [
                           "plenty for RANS meshes."),
     ]),
     Section("geometry", "Domain (periodic passage)", [
+        FieldSpec("domain.periodicity", "Cascade periodicity", "choice",
+                  "axisymmetric",
+                  choices=[
+                      _c("Axisymmetric periodics (unwrapped annulus)",
+                         "axisymmetric"),
+                      _c("Offset periodics (linear cascade)", "offset"),
+                      _c("Freestream boundaries (isolated airfoil)",
+                         "freestream")],
+                  tooltip="axisymmetric: the passage is the unwrapped "
+                          "annulus - pitch follows the radius (p = 2 pi R / "
+                          "N) and the tangential coordinate is the arc "
+                          "length 'uy'; imported/exported geomTurbo y is "
+                          "Cartesian and is unwrapped/re-wrapped "
+                          "automatically. offset: a linear cascade - "
+                          "constant pitch, straight periodic lines, y is "
+                          "Cartesian (no unwrap). freestream: no periodics "
+                          "- the upper/lower boundaries are far-field "
+                          "lines for isolated-airfoil calculations."),
         FieldSpec("domain.R1", "Annulus radius at LE (R1)", "float", 9.0,
                   0.01, 2000.0, slider=True, unit="mm",
                   tooltip="Actual annulus radius at the leading-edge axial "
@@ -259,10 +277,21 @@ SECTIONS = [
                           "station, in the same units as axial chord. Sets "
                           "the pitch there: p_TE = 2 pi R2 / N. Must equal "
                           "R1 for a single-translation periodic pair. "
-                          "Auto-filled when a geomTurbo file is imported."),
+                          "Auto-filled when a geomTurbo file is imported. "
+                          "Ignored in offset mode (constant pitch)."),
         FieldSpec("domain.airfoil_count", "Blade count N", "int", 45,
                   2, 300, step=1,
                   tooltip="Blades around the full annulus; pitch = 2 pi R / N."),
+        FieldSpec("domain.y_min", "Domain lower extent (freestream)",
+                  "float", -1.5, -8.0, -0.05, slider=True, unit="y/c_ax",
+                  tooltip="Lower boundary of the freestream domain, in "
+                          "axial-chord units below the blade. Only used "
+                          "with 'Freestream boundaries' periodicity."),
+        FieldSpec("domain.y_max", "Domain upper extent (freestream)",
+                  "float", 1.5, 0.05, 8.0, slider=True, unit="y/c_ax",
+                  tooltip="Upper boundary of the freestream domain, in "
+                          "axial-chord units above the blade. Only used "
+                          "with 'Freestream boundaries' periodicity."),
         FieldSpec("domain.x_min", "Domain inlet extent", "float", -0.5,
                   -3.0, 0.0, slider=True, unit="x/c_ax",
                   tooltip="Upstream extent of the passage, in axial-chord "

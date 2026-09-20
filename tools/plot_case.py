@@ -18,6 +18,7 @@ Optional postprocess hints:
 
 import csv
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from scipy.interpolate import griddata
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from freestream import state  # noqa: E402
+from render_config import is_freestream_case  # noqa: E402
 from su2_vtk import read_legacy_vtk  # noqa: E402
 
 GAMMA, R_AIR = 1.4, 287.058
@@ -330,9 +332,12 @@ def cascade_refs(cas, physics):
     p2 = cas["outlet"]["static_pressure"]
     T2 = T01 * (p2 / p01) ** ((g - 1) / g)
     V2 = (2 * g / (g - 1) * R * (T01 - T2)) ** 0.5
-    rho_i = physics.get("init_pressure", 1e5) / (R * physics.get("init_temperature", 660.0))
-    a_i = (g * R * physics.get("init_temperature", 660.0)) ** 0.5
-    q_init = 0.5 * rho_i * (physics["mach"] * a_i) ** 2
+    m_i = physics.get("init_mach", physics["mach"])
+    t_i = physics.get("init_temperature", 660.0)
+    p_i = physics.get("init_pressure", 1e5)
+    rho_i = p_i / (R * t_i)
+    a_i = (g * R * t_i) ** 0.5
+    q_init = 0.5 * rho_i * (m_i * a_i) ** 2
     return {"p01": p01, "T01": T01, "p2": p2, "T2": T2, "V2": V2,
             "M2": V2 / (g * R * T2) ** 0.5, "q_init": q_init}
 
@@ -637,8 +642,16 @@ def _first_layer_height(case_dir):
     return float(np.min(heights)), float(np.median(heights))
 
 
+def lift_to_drag(cl, cd):
+    """Return L/D = CL/CD, or None for a nonphysical drag value."""
+    cl, cd = float(cl), float(cd)
+    if not np.isfinite(cl) or not np.isfinite(cd) or cd <= 0.0:
+        return None
+    return cl / cd
+
+
 def write_results(case_dir, case, fs, dist=None):
-    """Write results.json: convergence, forces, cascade plane audit, y+."""
+    """Write results.json: convergence, forces, optional cascade audit, y+."""
     out = {"case": case_dir.resolve().name}
     hist = read_history(case_dir / "history.csv")
 
@@ -652,10 +665,13 @@ def write_results(case_dir, case, fs, dist=None):
         "target_rms": minval,
         "target_reached": bool(all(v[-1] <= minval for v in rms.values())),
     }
-    out["forces"] = {
+    forces = {
         "CD": float(hist["CD"][-1]),
         "CL": float(hist["CL"][-1]),
     }
+    if is_freestream_case(case):
+        forces["LD"] = lift_to_drag(forces["CL"], forces["CD"])
+    out["forces"] = forces
 
     d = load_volume(case_dir)
     pts, conn, mach, cp, vel = _volume_arrays(d)
@@ -663,7 +679,7 @@ def write_results(case_dir, case, fs, dist=None):
 
     # wall y+ from skin friction
     speed = np.linalg.norm(vel, axis=1)
-    cascade = case.get("cascade")
+    cascade = case.get("cascade") if not is_freestream_case(case) else None
     if cascade:
         refs = cascade_refs(cascade, case["physics"])
         V_ref, q_ref = refs["V2"], refs["q_init"]
@@ -706,6 +722,9 @@ def write_results(case_dir, case, fs, dist=None):
                     np.trapezoid(ri * u * vi[:, 1], y), np.trapezoid(ri * u * u, y)))),
                 "static_p_pa": float(np.trapezoid(ri * u * pi, y) / md),
                 "p0_pa": float(np.trapezoid(ri * u * p0l, y) / md),
+                # mean density from continuity: mass flow / integral of
+                # axial velocity over the pitch (used by the Zweifel numbers)
+                "density_kg_m3": float(md / np.trapezoid(u, y)),
             }
         p01 = cascade["inlet"]["total_pressure"]
         p2 = cascade["outlet"]["static_pressure"]
@@ -714,6 +733,35 @@ def write_results(case_dir, case, fs, dist=None):
         md_i = out["inlet"]["mass_flow_kg_s_m"]
         md_o = out["outlet"]["mass_flow_kg_s_m"]
         out["mass_balance"] = {"imbalance_pct": float(abs(md_i - md_o) / md_i * 100)}
+        # Zweifel loading coefficients (periodic cascades only). The
+        # incompressible form is the classic
+        #   Zw = 2 (s/bx) cos^2(a2) (tan a1 - tan a2)
+        # (a1/a2 mass-averaged flow angles from axial, signed); the
+        # compressible form corrects the momentum force by the
+        # inlet/outlet density ratio: Zw_c = Zw * (rho1/rho2)
+        # (e.g. Ni et al. 2024, "Modified Zweifel Coefficient ...",
+        # Aerospace 11(8):650). s = pitch from the periodic translation,
+        # bx = axial chord (reynolds_length).
+        pers = cascade.get("periodic") or []
+        pitch_m = float((pers[0].get("translation") or [0, 0, 0])[1] or 0.0) \
+            if pers else 0.0
+        bx_m = float(case["physics"].get("reynolds_length") or 0.0)
+        a1 = out["inlet"]["flow_angle_deg"]
+        a2 = out["outlet"]["flow_angle_deg"]
+        if pitch_m > 0.0 and bx_m > 0.0 and \
+                abs(90.0 - abs(a1)) > 1.0 and abs(90.0 - abs(a2)) > 1.0:
+            sbx = pitch_m / bx_m
+            zw_inc = 2.0 * sbx * math.cos(math.radians(a2)) ** 2 * \
+                (math.tan(math.radians(a1)) - math.tan(math.radians(a2)))
+            rho_ratio = out["inlet"]["density_kg_m3"] / \
+                out["outlet"]["density_kg_m3"]
+            out["zweifel"] = {
+                "incompressible": float(zw_inc),
+                "compressible": float(zw_inc * rho_ratio),
+                "pitch_over_axial_chord": float(sbx),
+                "alpha1_deg": float(a1),
+                "alpha2_deg": float(a2),
+            }
         # corrected flow W*sqrt(theta)/delta (NASA Glenn): the mass flow
         # normalized to standard reference conditions, T0ref = 288.15 K,
         # p0ref = 101325 Pa. theta uses the row total temperature (constant
@@ -755,19 +803,20 @@ def main():
                case["physics"].get("freestream_temperature", 288.15),
                case["physics"].get("gamma", 1.4), case["physics"].get("gas_constant", 287.058))
     pp = case.get("postprocess", {})
+    freestream = is_freestream_case(case)
 
     d = load_volume(case_dir)
     pts, conn, mach, cp, vel = _volume_arrays(d)
     plot_convergence(case_dir, case_name, case.get("unsteady"))
     pitch = 0.0
-    if "cascade" in case:
+    if "cascade" in case and not freestream:
         pers = case["cascade"].get("periodic") or []
         if pers:
             pitch = float((pers[0].get("translation") or [0, 0, 0])[1] or 0.0)
     plot_fields(case_dir, pts, conn, mach, cp, pitch=pitch)
     gamma = case["physics"].get("gamma", GAMMA)
     ss_upper = case.get("postprocess", {}).get("ss_upper", True)
-    if "cascade" in case:
+    if "cascade" in case and not freestream:
         refs = cascade_refs(case["cascade"], case["physics"])
         wp = wall_points(pts, vel, refs["V2"])
         plot_nearwall_cascade(case_dir, pp, pts, conn, vel, wp, refs["V2"])

@@ -97,6 +97,19 @@ def test_gamma_model():
     print(f"gamma OK (auto {g:.4f} @ {T01:g} K; explicit 1.35 overrides)")
 
 
+def test_cascade_initialization():
+    """Startup state is pressure-balanced and lower-flow than the reference."""
+    from tools.setup_cascade_case import cascade_flow_states
+
+    s = cascade_flow_states(125000.0, 700.0, 81266.7, 1.36383165686)
+    assert s["mach_init"] < s["mach_exit"]
+    assert s["mach_init"] <= 0.2
+    assert abs(s["init_pressure"] - 81266.7) < 1e-8
+    assert abs(s["init_temperature"] - s["temperature_exit"]) < 1e-8
+    print(f"cascade init OK (Mexit={s['mach_exit']:.3f}, "
+          f"Minit={s['mach_init']:.3f})")
+
+
 def test_geomturbo_import():
     import copy
     import tempfile
@@ -141,13 +154,15 @@ def test_geomturbo_import():
         for section_z in (0.0, 0.025):
             lines += [f"# SECTION {1 if section_z == 0.0 else 2}",
                       "XYZ", str(len(ss))]
-            lines += [f"{section_z:.9f} {y * scale:.9f} {x * scale:.9f}"
+            # NUMECA row convention: Z -Y X (the stored Y is the negative
+            # of the canonical Cartesian y)
+            lines += [f"{section_z:.9f} {-y * scale:.9f} {x * scale:.9f}"
                       for x, y in ss]
         lines += ["pressure", "SECTIONAL", "2"]
         for section_z in (0.0, 0.025):
             lines += [f"# SECTION {1 if section_z == 0.0 else 2}",
                       "XYZ", str(len(ps))]
-            lines += [f"{section_z:.9f} {y * scale:.9f} {x * scale:.9f}"
+            lines += [f"{section_z:.9f} {-y * scale:.9f} {x * scale:.9f}"
                       for x, y in ps]
         lines += ["NI_END nibladegeometry"]
         gt.write_text("\n".join(lines))
@@ -158,6 +173,10 @@ def test_geomturbo_import():
         assert parsed["sections"][0]["ss"].shape == (len(ss), 3)
         assert parsed["sections"][0]["ps"].shape == (len(ps), 3)
         assert parsed["hub"] is not None and parsed["shroud"] is not None
+        # the stored -Y is flipped on read: the canonical y matches the
+        # generator's y even though the file rows carry the negated value
+        assert np.allclose(parsed["sections"][0]["ss"][:, 1],
+                           ss[:, 1] * scale), "read-side -Y flip"
 
         inf = infer_cascade_parameters(parsed, 0)
         assert inf["blade_count"] == 20
@@ -235,7 +254,21 @@ def test_geomturbo_import():
     from pipeline.geomturbo import write_geomturbo
     with tempfile.TemporaryDirectory() as tmp2:
         export = Path(tmp2) / "export.geomTurbo"
-        write_geomturbo(export, ref["ss"] * 0.105, ref["ps"] * 0.105, z=0.0)
+        r_m = 0.35        # export annulus radius, meters
+        write_geomturbo(export, ref["ss"] * 0.105, ref["ps"] * 0.105,
+                        r1=r_m, r2=r_m)
+        # rows carry NUMECA's inverted Y and the spanwise Z computed from
+        # the radius and the Cartesian y: z = sqrt(R^2 - y^2)
+        text_lines = export.read_text().splitlines()
+        i = text_lines.index("XYZ")
+        count = int(text_lines[i + 1])
+        rows = [ln.split() for ln in text_lines[i + 2:i + 2 + count]]
+        y_stored = np.array([float(r[1]) for r in rows])
+        z_stored = np.array([float(r[0]) for r in rows])
+        y_can = ref["ss"][:, 1] * 0.105
+        assert np.allclose(y_stored, -y_can, atol=1e-9), "write-side -Y flip"
+        assert np.allclose(z_stored, np.sqrt(r_m ** 2 - y_can ** 2),
+                           atol=1e-9), "writer Z from radius + Cartesian y"
         back = section_to_airfoil(parse_geomturbo(export)["sections"][0],
                                   n_points=len(ref["ss"]))
     assert len(back["ss"]) == len(ref["ss"])
@@ -321,11 +354,14 @@ def test_optimizer():
     (no CFD runs)."""
     import random
     from foilage_gui.optimizer import (CONSTRAINT_QUANTITIES, DESIGN_VARS,
-                                       OBJECTIVES, PENALTY, OptimizationRun,
+                                       FREESTREAM_OBJECTIVES, OBJECTIVES,
+                                       PENALTY, OptimizationRun,
                                        apply_kind, constraint_violation,
                                        constrained_dominates, dominates,
                                        hypervolume, lhs_sample,
                                        nondominated_fronts,
+                                       objectives_for_case,
+                                       constraint_quantities_for_case,
                                        polynomial_mutation, sbx_crossover)
 
     F = [(0.0, 1.0), (0.5, 0.5), (1.0, 0.0), (0.4, 1.5), (0.5, 0.9),
@@ -380,6 +416,19 @@ def test_optimizer():
     for dv in DESIGN_VARS:
         assert dv["path"] in schema_paths, dv["path"]
     assert len({o["path"] for o in OBJECTIVES}) == len(OBJECTIVES)
+    assert "forces.CL" not in {o["path"] for o in OBJECTIVES}
+    assert {o["path"] for o in FREESTREAM_OBJECTIVES} == {"forces.LD"}
+    assert "forces.LD" not in {o["path"] for o in objectives_for_case(False)}
+    assert "forces.LD" in {o["path"] for o in objectives_for_case(True)}
+    assert "forces.LD" not in {
+        c["path"] for c in constraint_quantities_for_case(False)}
+    assert "forces.LD" in {
+        c["path"] for c in constraint_quantities_for_case(True)}
+
+    from tools.plot_case import lift_to_drag
+    assert lift_to_drag(2.4, 0.12) == 20.0
+    assert lift_to_drag(2.4, 0.0) is None
+    assert lift_to_drag(2.4, -0.12) is None
 
     # the per-evaluation input writer: dv overrides, R1=R2 sync, case copy
     base = {"case": {"name": "x", "output_dir": "cases"},
@@ -859,17 +908,213 @@ def test_optimizer_dvs():
           f"{len(dvs)}, geomturbo+cage {len(dvg)}; morph auto-enable)")
 
 
+def test_periodicity_modes():
+    """Periodicity modes: offset (constant pitch, straight periodics),
+    freestream (no periodics, far-field box), and the Cartesian-y <->
+    unwrapped-y conversion of imported sections in axisymmetric mode."""
+    import shutil
+    import numpy as np
+    from pipeline.mesh_tris import periodic_edges, pitch_profile
+    from pipeline.unwrap import (cartesian_to_uy, is_periodic,
+                                 periodicity_of, uy_to_cartesian)
+
+    # mode helpers
+    assert periodicity_of({}) == "axisymmetric"
+    assert periodicity_of({"periodicity": "weird"}) == "axisymmetric"
+    assert not is_periodic({"periodicity": "freestream"})
+    assert is_periodic({"periodicity": "offset"})
+
+    # conversions: exact definitions and a lossless roundtrip
+    y = np.array([-0.3, -0.1, 0.0, 0.1, 0.3])
+    sec = np.column_stack([np.linspace(0, 1, 5), y])
+    R = 0.9
+    uy, _ = cartesian_to_uy(sec, sec, R)
+    assert np.allclose(uy[:, 1], R * np.arcsin(y / R))
+    back, _ = uy_to_cartesian(uy, uy, R)
+    assert np.allclose(back, sec)
+    same, _ = cartesian_to_uy(sec, sec, None)      # no radius -> identity
+    assert np.array_equal(same, sec)
+
+    af = {"ss": np.column_stack([np.linspace(0, 1, 50),
+                                 np.linspace(0.05, -0.05, 50)]),
+          "ps": np.column_stack([np.linspace(0, 1, 50),
+                                 np.linspace(-0.05, 0.05, 50)]),
+          "axial_chord": 100.0}
+    dom = {"R1": 90.0, "R2": 110.0, "airfoil_count": 45,
+           "x_min": -0.5, "x_max": 2.5}
+
+    # axisymmetric: pitch follows the radius
+    prof = pitch_profile({**dom, "periodicity": "axisymmetric"}, af)
+    assert prof["periodic"] and abs(prof["p_le"] - prof["p_te"]) > 1e-9
+
+    # offset: constant pitch (R2 ignored), straight periodic lines at
+    # y = -/+ p/2 with no tangential offset
+    profo = pitch_profile({**dom, "periodicity": "offset"}, af)
+    assert profo["periodic"] and abs(profo["p_le"] - profo["p_te"]) < 1e-12
+    assert abs(profo["p_le"] - 2 * np.pi * 0.9 / 45) < 1e-12
+    bot, top = periodic_edges(profo, -0.5, 2.5)
+    assert np.allclose(bot[:, 1], -profo["p_le"] / 2.0)
+    assert np.allclose(top[:, 1] - bot[:, 1], profo["p_le"])
+
+    # freestream: no periodics, straight far-field lines at y_min / y_max
+    proff = pitch_profile({**dom, "periodicity": "freestream",
+                           "y_min": -1.5, "y_max": 1.5}, af)
+    assert not proff["periodic"]
+    botf, topf = periodic_edges(proff, -0.5, 2.5)
+    assert np.allclose(botf[:, 1], -1.5) and np.allclose(topf[:, 1], 1.5)
+
+    # ---- imported sections unwrap only in axisymmetric mode; the export
+    # re-wraps them back to Cartesian y (lossless roundtrip)
+    from pipeline.airfoil import build_geometry
+    from pipeline.geomturbo import write_geomturbo
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        x = np.linspace(0.0, 0.1, 61)
+        cam = 0.02 * np.sin(np.pi * x / 0.1)
+        thk = 0.004 * (1 - x / 0.1) + 0.0008
+        gt = write_geomturbo(
+            tmp / "s.geomTurbo",
+            np.column_stack([x, cam + thk / 2]),
+            np.column_stack([x, cam - thk / 2]), z=0.0, units="m")
+
+        def build(mode):
+            return build_geometry({
+                "airfoil": {"n_points": 121, "axial_chord": 100.0},
+                "domain": {"periodicity": mode, "R1": 90.0, "R2": 90.0,
+                           "airfoil_count": 45, "x_min": -0.5, "x_max": 2.5},
+                "airfoil_source": {"type": "geomturbo",
+                                   "geomturbo_file": str(gt),
+                                   "section": 0}})
+
+        af_ax = build("axisymmetric")
+        af_off = build("offset")
+        assert np.allclose(af_ax["ss"][:, 0], af_off["ss"][:, 0])
+        assert np.max(np.abs(af_ax["ss"][:, 1])) > \
+            np.max(np.abs(af_off["ss"][:, 1])), "unwrap must stretch |y|"
+        # export direction: re-wrap -> exactly the Cartesian shape
+        back_ss, back_ps = uy_to_cartesian(af_ax["ss"], af_ax["ps"], 0.9)
+        assert np.allclose(back_ss, af_off["ss"])
+        assert np.allclose(back_ps, af_off["ps"])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- validation follows the mode
+    inputs = sorted((REPO / "cases").glob("*/input.json"))
+    if inputs:
+        from foilage_gui.state import CaseState
+        st = CaseState(inputs[0])
+        st.set("domain.R2", st.get("domain.R1") + 1.0)
+        assert any("R1" in m for _s, m in st.validate())
+        st.set("domain.periodicity", "offset")
+        assert not any("R1" in m for _s, m in st.validate())
+        st.set("domain.periodicity", "freestream")
+        st.set("domain.y_min", 1.0)
+        st.set("domain.y_max", -1.0)
+        assert any("y_max" in m for _s, m in st.validate())
+
+    # ---- freestream case.json renders MARKER_FAR and no MARKER_PERIODIC
+    from render_config import cascade_marker_lines, is_freestream_case
+    from pipeline.quadify import (FREESTREAM_MARKERS, PERIODIC_MARKERS,
+                                  _marker_layout)
+    assert _marker_layout(("fluid", "airfoil", "inlet", "outlet",
+                           "farfield")) == FREESTREAM_MARKERS
+    assert _marker_layout(("fluid", "airfoil", "inlet", "outlet",
+                           "periodic_bottom", "periodic_top")) == \
+        PERIODIC_MARKERS
+    case = {"boundary_mode": "cascade", "cascade": {
+        "inlet": {"marker": "inlet", "total_pressure": 125000.0,
+                  "total_temperature": 700.0, "direction": [1.0, 0.0, 0.0]},
+        "outlet": {"marker": "outlet", "static_pressure": 60000.0}},
+        "markers": {"airfoil": {"bc": "wall_adiabatic"},
+                    "farfield": {"bc": "farfield"}}}
+    txt = cascade_marker_lines(case)
+    assert "MARKER_FAR= ( farfield )" in txt and "MARKER_PERIODIC" not in txt
+    assert not is_freestream_case(case)
+    case["boundary_mode"] = "freestream"
+    case["markers"] = {
+        "airfoil": {"bc": "wall_adiabatic"},
+        "inlet": {"bc": "farfield"},
+        "outlet": {"bc": "farfield"},
+        "farfield": {"bc": "farfield"},
+    }
+    txt = cascade_marker_lines(case)
+    assert "MARKER_FAR= ( inlet, outlet, farfield )" in txt
+    assert "MARKER_INLET" not in txt and "MARKER_OUTLET" not in txt
+    case["cascade"]["periodic"] = [
+        {"markers": ["periodic_bottom", "periodic_top"],
+         "translation": [0.0, 0.012, 0.0]}]
+    assert "MARKER_PERIODIC" not in cascade_marker_lines(case)
+    case["boundary_mode"] = "cascade"
+    assert "MARKER_PERIODIC" in cascade_marker_lines(case)
+    print("periodicity OK (offset const-pitch, freestream box, "
+          "Cartesian<->uy unwrap, cfg markers, validation)")
+
+
+def test_zweifel():
+    """Zweifel loading coefficients: the exact incompressible criterion,
+    the geometric metal-angle predictor, and the post-processing block
+    written for periodic cases."""
+    import shutil
+    import numpy as np
+    from pipeline.cascade_metrics import metal_angles, zweifel_geometric
+
+    # exact-math check of the classic criterion: s/bx = 1, a1 = 30 deg,
+    # a2 = -60 deg -> 2 * cos^2(60) * (tan30 + tan60) = 1.1547
+    assert abs(zweifel_geometric(1.0, 30.0, -60.0) - 1.154700538) < 1e-6
+    # metal angles of a straight (uncambered) section are ~0
+    ss = np.column_stack([np.linspace(0, 1, 30), np.zeros(30)])
+    ps = np.column_stack([np.linspace(0, 1, 30), -0.1 * np.ones(30)])
+    a1, a2 = metal_angles(ss, ps)
+    assert abs(a1) < 1e-6 and abs(a2) < 1e-6, (a1, a2)
+
+    # post-processing block from a solved periodic case
+    src = REPO / "cases" / "turbine_blade_4"
+    if not (src / "vol_solution.vtk").exists() or \
+            not (src / "case.json").exists():
+        print("zweifel SKIPPED (no solved periodic case on disk)")
+        return
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        for f in ("case.json", "history.csv", "vol_solution.vtk", "mesh.su2"):
+            shutil.copy2(src / f, tmp / f)
+        from plot_case import write_results
+        from freestream import state as freestream_state
+        case = json.loads((tmp / "case.json").read_text())
+        ph = case["physics"]
+        fs = freestream_state(
+            ph["mach"], ph["reynolds"],
+            ph.get("reynolds_length", 1.0),
+            ph.get("freestream_temperature", 288.15),
+            ph.get("gamma", 1.4), ph.get("gas_constant", 287.058))
+        write_results(tmp, case, fs, dist=None)
+        res = json.loads((tmp / "results.json").read_text())
+        zw = res.get("zweifel")
+        assert zw, "no zweifel block for a periodic case"
+        assert zw["incompressible"] > 0.0 and zw["compressible"] > 0.0
+        ratio = zw["compressible"] / zw["incompressible"]
+        assert 0.5 <= ratio <= 3.0, ratio       # rho1/rho2 of a turbine
+        assert zw["alpha1_deg"] > 0.0 > zw["alpha2_deg"]
+        print(f"zweifel OK (inc {zw['incompressible']:.3f}, "
+              f"comp {zw['compressible']:.3f}, rho-ratio {ratio:.3f}, "
+              f"s/bx {zw['pitch_over_axial_chord']:.3f})")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     test_schema()
     test_state_roundtrip()
     test_validation()
     test_derived()
     test_gamma_model()
+    test_cascade_initialization()
     test_optimizer()
     test_optimizer_pause_state()
     test_ffd_morph()
     test_plugins()
     test_optimizer_dvs()
+    test_periodicity_modes()
+    test_zweifel()
     test_geomturbo_import()
     test_geomturbo_external_samples()
     test_su2_mesh_reader()

@@ -9,6 +9,11 @@ heights) is expressed in these axial-chord units.
 
 import numpy as np
 
+try:
+    from unwrap import periodicity_of
+except ImportError:                                  # package-style import
+    from pipeline.unwrap import periodicity_of
+
 
 def build_geometry(cfg):
     """Dispatch on airfoil_source.type: pyturbo-aero generation (default),
@@ -62,6 +67,9 @@ def build_geometry(cfg):
             af["section_z"] = None
             af["blade_count"] = result.get("blade_count")
         af["airfoil2d"] = None
+        unwrap = _imported_section_unwrap(cfg)
+        if unwrap is not None:
+            af["ss"], af["ps"] = unwrap(af["ss"], af["ps"])
         # imported and generated-plugin sections share the morph stage
         morph = src.get("morph")
         if isinstance(morph, dict) and morph.get("enabled"):
@@ -74,10 +82,41 @@ def build_geometry(cfg):
                                             af["ss_upper"])
             af["morph_cage"] = cage
         else:
+            try:
+                from pipeline.ffd import rebuild_outline
+            except ImportError:
+                from ffd import rebuild_outline
+            af["outline"] = rebuild_outline(af["ss"], af["ps"],
+                                            af["ss_upper"])
             af["morph_cage"] = None
     af["axial_chord"] = float(cfg.get("airfoil", {}).get("axial_chord")
                               or 1.0)
     return af
+
+
+def _imported_section_unwrap(cfg):
+    """Cartesian-y -> uy converter for imported/plugin sections, or None
+    when no unwrapping applies.
+
+    Only the axisymmetric mode unwraps: imported sections (geomTurbo
+    machine coordinates) and plugin output come in Cartesian y around
+    the machine axis, while the mesh plane uses the arc-length
+    unwrapped y (see pipeline/unwrap.py). The conversion radius is the
+    annulus radius R1 in axial-chord units. In offset mode y is
+    Cartesian already; freestream has no periodics at all."""
+    dom = cfg.get("domain") or {}
+    if periodicity_of(dom) != "axisymmetric":
+        return None
+    r1 = dom.get("R1")
+    ac = float(cfg.get("airfoil", {}).get("axial_chord") or 1.0)
+    if not r1 or ac <= 0:
+        return None
+    try:
+        from pipeline.unwrap import cartesian_to_uy
+    except ImportError:
+        from unwrap import cartesian_to_uy
+    radius = float(r1) / ac
+    return lambda ss, ps: cartesian_to_uy(ss, ps, radius)
 
 
 def build_airfoil(af_cfg):

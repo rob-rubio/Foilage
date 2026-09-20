@@ -35,12 +35,16 @@ for p in (str(REPO), str(REPO / "pipeline")):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from pipeline.airfoil import build_geometry           # noqa: E402
-from pipeline.cascade_metrics import (channel_widths, curvature, throat_metrics,
-                                       true_chord)
+from pipeline.airfoil import (build_geometry,                 # noqa: E402
+                              _imported_section_unwrap)
+from pipeline.cascade_metrics import (channel_widths, curvature, metal_angles,
+                                       throat_metrics, true_chord,
+                                       zweifel_geometric)
 from pipeline.ffd import MAX_N, MIN_N, bernstein_basis  # noqa: E402
 from pipeline.mesh_tris import pitch_profile, periodic_edges  # noqa: E402
 from pipeline.plugins import (discover_plugins, type_choices)  # noqa: E402
+from pipeline.unwrap import (cartesian_to_uy, periodicity_of,        # noqa: E402
+                             uy_to_cartesian)
 
 from .schema import field_from_dict, sections_for      # noqa: E402
 from .widgets import INVALID_BG, FieldWidget, ScrolledFrame, Tooltip  # noqa: E402
@@ -61,22 +65,38 @@ def _compute_geometry(cfg):
     Returns (data dict) or ("error", message)."""
     try:
         airfoil = build_geometry(cfg)
-        prof = pitch_profile(cfg.get("domain", {}), airfoil)
-        x0 = float(cfg.get("domain", {}).get("x_min", -0.5))
-        x1 = float(cfg.get("domain", {}).get("x_max", 2.5))
+        dom = cfg.get("domain", {})
+        prof = pitch_profile(dom, airfoil)
+        x0 = float(dom.get("x_min", -0.5))
+        x1 = float(dom.get("x_max", 2.5))
         bot, top = periodic_edges(prof, x0, x1)
         outline = airfoil["outline"]
-        ghost_p = outline + np.column_stack(
-            [np.zeros(len(outline)), prof["p"](outline[:, 0])])
-        ghost_m = outline - np.column_stack(
-            [np.zeros(len(outline)), prof["p"](outline[:, 0])])
+        if prof.get("periodic", True):
+            offs = np.column_stack(
+                [np.zeros(len(outline)), prof["p"](outline[:, 0])])
+            ghost_p, ghost_m = outline + offs, outline - offs
+        else:
+            # freestream mode: there are no neighbouring blades
+            ghost_p = ghost_m = None
         ss, ps = airfoil["ss"], airfoil["ps"]
 
         # ---- channel + throat (blade vs pitch-translated neighbor) ----
+        # a freestream domain has no neighbor and no cascade throat
         pitch = prof["p"]
-        s_ch, _j = channel_widths(ss, ps, pitch, airfoil["ss_upper"])
-        throat = throat_metrics(ss, ps, pitch, airfoil["ss_upper"])
+        if prof.get("periodic", True):
+            s_ch, _j = channel_widths(ss, ps, pitch, airfoil["ss_upper"])
+            throat = throat_metrics(ss, ps, pitch, airfoil["ss_upper"])
+        else:
+            s_ch, throat = None, None
         chord_cax = true_chord(ss, ps)
+        # geometric Zweifel predictor (periodic modes): metal angles from
+        # the section tangents + throat pitch over the axial chord (= 1)
+        zw_geo = None
+        a1_metal = a2_metal = None
+        if throat is not None:
+            a1_metal, a2_metal = metal_angles(ss, ps)
+            zw_geo = zweifel_geometric(float(throat["pitch_throat"]),
+                                       a1_metal, a2_metal)
 
         # ---- surface curvature ----
         k_ss, _s_ss = curvature(ss)
@@ -84,7 +104,8 @@ def _compute_geometry(cfg):
 
         # ---- imported geomTurbo reference overlay ----
         # the section is normalized to axial chord = 1 (same frame as the
-        # generated blade) - raw file coordinates may be in any unit
+        # generated blade) - raw file coordinates may be in any unit; in
+        # axisymmetric mode it is unwrapped to uy like the active blade
         src = cfg.get("airfoil_source") or {}
         import_pts = None
         ref_err = None
@@ -100,7 +121,11 @@ def _compute_geometry(cfg):
                 sec = secs[max(0, min(idx, len(secs) - 1))]
                 n_ref = int(cfg.get("airfoil", {}).get("n_points", 401))
                 ref_af = section_to_airfoil(sec, n_points=n_ref)
-                import_pts = (ref_af["ss"], ref_af["ps"])
+                ref_ss, ref_ps = ref_af["ss"], ref_af["ps"]
+                unwrap = _imported_section_unwrap(cfg)
+                if unwrap is not None:
+                    ref_ss, ref_ps = unwrap(ref_ss, ref_ps)
+                import_pts = (ref_ss, ref_ps)
                 import_mtime = gt_path.stat().st_mtime
             except Exception as e:
                 ref_err = f"{type(e).__name__}: {e}"
@@ -110,6 +135,8 @@ def _compute_geometry(cfg):
         return {
             "ss": ss, "ps": ps, "outline": outline,
             "bot": bot, "top": top, "ghost_p": ghost_p, "ghost_m": ghost_m,
+            "mode": prof.get("mode", "axisymmetric"),
+            "periodic": prof.get("periodic", True),
             "style": airfoil["style"], "ss_upper": airfoil["ss_upper"],
             "n_points": len(ss), "x0": x0, "x1": x1,
             "turning": (float(a1) - float(a2))
@@ -118,8 +145,9 @@ def _compute_geometry(cfg):
             "p_le": prof["p_le"], "p_te": prof["p_te"],
             "true_chord_cax": chord_cax,
             "radius_throat_cax": float(prof["radius"](
-                throat["x_over_cax"])),
-            "pitch_to_chord": throat["pitch_throat"] / max(chord_cax, 1e-30),
+                throat["x_over_cax"])) if throat else None,
+            "pitch_to_chord": (throat["pitch_throat"] / max(chord_cax, 1e-30))
+            if throat else None,
             "source": src.get("type", "pyturbo"),
             "blade_count": airfoil.get("blade_count"),
             "morph_cage": airfoil.get("morph_cage"),
@@ -130,6 +158,9 @@ def _compute_geometry(cfg):
             "channel_x": ss[:, 0], "channel_s": s_ch,
             "k_ss": k_ss, "k_ps": k_ps,
             "throat": throat,
+            "zweifel_geometric": zw_geo,
+            "angle_metal_inlet_deg": a1_metal,
+            "angle_metal_exit_deg": a2_metal,
         }
     except Exception as e:
         return ("error", f"{type(e).__name__}: {e}")
@@ -634,9 +665,11 @@ class GeometryTab(ttk.Frame):
             self._ac_before_infer = cur_ac     # remember the generator value
         updates = [("airfoil.axial_chord", inf["axial_chord"] * to_current),
                    ("domain.airfoil_count", inf["blade_count"])]
-        if inf["R1"] is not None:
+        if inf["R1"] is not None and inf["R1"] > 0.0:
+            # a 2D section with its LE exactly on the axis infers R1 = 0,
+            # which would collapse the passage - keep the current value
             updates.append(("domain.R1", inf["R1"] * to_current))
-        if inf["R2"] is not None:
+        if inf["R2"] is not None and inf["R2"] > 0.0:
             updates.append(("domain.R2", inf["R2"] * to_current))
         applied = []
         for path_key, value in updates:
@@ -653,8 +686,13 @@ class GeometryTab(ttk.Frame):
         """Save the active blade section (SS/PS) as a .geomTurbo file.
 
         Coordinates are exported in meters: the normalized preview arrays
-        are scaled by the physical axial chord.
-        """
+        are scaled by the physical axial chord. In axisymmetric mode the
+        preview lives in unwrapped y (arc length), while geomTurbo files
+        hold Cartesian y - the section is re-wrapped (y = R sin(uy / R))
+        before writing. Offset/freestream modes have nothing to unwrap.
+        The spanwise Z of each point is computed by the writer from the
+        annulus radius and the Cartesian y (z = sqrt(R^2 - y^2)), and the
+        rows carry NUMECA's inverted-Y convention (Z -Y X)."""
         from tkinter import filedialog, messagebox
         g = self._last_good
         if g is None:
@@ -664,7 +702,23 @@ class GeometryTab(ttk.Frame):
                 "preview to finish and try again.")
             return
         from pipeline.geomturbo import write_geomturbo
+        dom = self.app.state.config.get("domain", {})
+        ac = float(self.app.state.get("airfoil.axial_chord") or 1.0)
         scale = self.app.state.scale_m_per_chord()      # m per chord unit
+        units_to_m = 0.001 if ac >= 1.0 else 1.0
+        ss_out, ps_out = g["ss"], g["ps"]
+        r1_m = r2_m = None
+        r1 = dom.get("R1")
+        if r1 and ac > 0 and dom.get("periodicity", "axisymmetric") \
+                != "freestream":
+            # radii in the exported unit (meters) for the writer's Z
+            r1_m = float(r1) * units_to_m
+            r2_m = float(dom.get("R2") or r1) * units_to_m
+        if g.get("periodic", True) and \
+                periodicity_of(dom) == "axisymmetric":
+            ss_out, ps_out = uy_to_cartesian(
+                ss_out, ps_out,
+                float(r1) / ac if r1 and ac > 0 else None)
         path = filedialog.asksaveasfilename(
             title="Save blade section as geomTurbo",
             defaultextension=".geomTurbo",
@@ -672,8 +726,8 @@ class GeometryTab(ttk.Frame):
             filetypes=[("geomTurbo", "*.geomTurbo"), ("All files", "*.*")])
         if not path:
             return
-        write_geomturbo(path, g["ss"] * scale, g["ps"] * scale, z=0.0,
-                        units="m")
+        write_geomturbo(path, ss_out * scale, ps_out * scale,
+                        r1=r1_m, r2=r2_m, units="m")
         # remember the file so switching the source to geomTurbo picks it up
         self.app.state.set("airfoil_source.geomturbo_file", path,
                            notify=False)
@@ -771,7 +825,10 @@ class GeometryTab(ttk.Frame):
         if g["turning"] is not None:
             parts.append(f"turning {g['turning']:.1f} deg")
         parts.append(f"pitch LE {g['p_le']:.4f}, TE {g['p_te']:.4f}")
-        parts.append(f"PTC {g['pitch_to_chord']:.4f}")
+        if g.get("pitch_to_chord") is not None:
+            parts.append(f"PTC {g['pitch_to_chord']:.4f}")
+        parts.append({True: "periodic", False: "freestream"}[
+            g.get("periodic", True)])
         parts.append(f"{g['n_points']} points/side")
         if g.get("blade_count") is not None:
             parts.append(f"{g['blade_count']} blades")
@@ -786,13 +843,23 @@ class GeometryTab(ttk.Frame):
         return "  |  ".join(parts)
 
     def _update_metrics(self, g):
-        t = g["throat"]
         scale_mm = self.app.state.scale_m_per_chord() * 1000.0
+        if g.get("throat") is None:
+            # freestream mode: no pitch-translated neighbor, no throat
+            self.metrics_var.set(
+                f"true chord {g['true_chord_cax']:.4f} c_ax "
+                f"({g['true_chord_cax'] * scale_mm:.2f} mm)   |   "
+                "freestream mode - cascade throat metrics not applicable")
+            return
+        t = g["throat"]
         self.metrics_var.set(
             f"throat {t['width']:.4f} c_ax ({t['width'] * scale_mm:.2f} mm) "
             f"@ x/c_ax {t['x_over_cax']:.3f}   |   "
             f"true chord {g['true_chord_cax']:.4f} c_ax   |   "
             f"PTC {g['pitch_to_chord']:.4f}   |   "
+            f"Zw_geo {g.get('zweifel_geometric', 0):.3f} "
+            f"(metal {g.get('angle_metal_inlet_deg', 0):.1f}/"
+            f"{g.get('angle_metal_exit_deg', 0):.1f} deg)   |   "
             f"\u03b1_throat {t['angle_throat_deg']:.1f}\u00b0   |   "
             f"unguided {t['unguided_turning_deg']:.1f}\u00b0")
 
@@ -803,12 +870,15 @@ class GeometryTab(ttk.Frame):
         outline = g["outline"]
 
         # passage envelope + ghost blades for context
+        edge_lbl = "periodic edges" if g.get("periodic", True) \
+            else "far-field boundaries"
         ax.plot(g["bot"][:, 0], g["bot"][:, 1], "--", color="0.55", lw=1,
-                label="periodic edges")
+                label=edge_lbl)
         ax.plot(g["top"][:, 0], g["top"][:, 1], "--", color="0.55", lw=1)
-        for ghost in (g["ghost_p"], g["ghost_m"]):
-            closed = np.vstack([ghost, ghost[0]])
-            ax.plot(closed[:, 0], closed[:, 1], color="0.8", lw=1)
+        if g.get("ghost_p") is not None:
+            for ghost in (g["ghost_p"], g["ghost_m"]):
+                closed = np.vstack([ghost, ghost[0]])
+                ax.plot(closed[:, 0], closed[:, 1], color="0.8", lw=1)
 
         # geomTurbo reference under the active blade
         if g["source"] == "pyturbo" and g["show_reference"] \
@@ -895,6 +965,15 @@ class GeometryTab(ttk.Frame):
     def _draw_channel(self, g):
         fig, ax, cvs = self._chart_tabs["Channel"]
         ax.clear()
+        if g.get("channel_s") is None:
+            ax.text(0.5, 0.5, "no cascade channel in freestream mode",
+                    transform=ax.transAxes, ha="center", fontsize=9,
+                    color="0.4")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            fig.tight_layout()
+            cvs.draw_idle()
+            return
         ax.plot(g["channel_x"], g["channel_s"], color="#1f4e79", lw=1.4)
         i = int(np.argmin(g["channel_s"]))
         w = float(g["channel_s"][i])

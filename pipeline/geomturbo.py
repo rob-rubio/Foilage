@@ -2,11 +2,12 @@
 
 The native blade geometry is stored as two explicit ``SECTIONAL`` blocks:
 ``suction`` and ``pressure``.  Each contains one or more sections, and each
-section contains an ``XYZ`` point count followed by coordinates.  In the
-files examined by this project, NUMECA stores those coordinates as ``Z Y X``;
-the public Python reader used as a cross-check also converts them to internal
-``X Y Z`` order.  This module returns canonical ``X Y Z`` arrays so the rest
-of the pipeline can work with the same coordinates as the generated
+section contains an ``XYZ`` point count followed by coordinates.  NUMECA
+stores those coordinate rows in ``Z -Y X`` order: the first row value is
+the spanwise Z, the second is the *negative* of the Cartesian transverse
+y (the sign is flipped back on read and applied on write), and the third
+is the axial X.  This module returns canonical ``X Y Z`` arrays so the
+rest of the pipeline can work with the same coordinates as the generated
 airfoils.
 
 The older simplified ``BEGINSECTION`` layout is retained as a read-only
@@ -54,9 +55,15 @@ def _integer_line(line):
 
 
 def _canonical_points(raw):
-    """Convert file-order ``Z Y X`` coordinates to canonical ``X Y Z``."""
+    """Convert file-order ``Z -Y X`` coordinates to canonical ``X Y Z``.
+
+    NUMECA stores the transverse coordinate with an inverted sign: the
+    stored Y is the *negative* of the canonical Cartesian y, so it is
+    negated here. Every native reader path goes through this function."""
     raw = np.asarray(raw, dtype=float)
-    return raw[:, [2, 1, 0]]
+    pts = raw[:, [2, 1, 0]]              # Z Y X -> X Y Z (column order)
+    pts[:, 1] *= -1.0                    # stored -Y -> canonical Cartesian y
+    return pts
 
 
 def _skip_comments(lines, index):
@@ -381,12 +388,24 @@ def _poly_area(poly):
     return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
 
 
-def write_geomturbo(path, ss, ps, z=0.0, units="m"):
+def write_geomturbo(path, ss, ps, r1=None, r2=None, z=0.0, units="m"):
     """Write a single-section .geomTurbo file from SS/PS point arrays.
 
-    ``ss`` and ``ps`` are canonical ``X Y`` arrays ordered LE -> TE.  Native
-    NUMECA point rows are written as ``Z Y X``.  ``units`` may be a NUMECA
-    scale factor or a common unit name such as ``"m"`` or ``"mm"``.
+    ``ss`` and ``ps`` are canonical ``X Y`` arrays ordered LE -> TE, with
+    Cartesian y (unwrapped/uy coordinates must be re-wrapped by the
+    caller before writing). Native NUMECA point rows are written in
+    ``Z -Y X`` order: the stored Y is the negative of the canonical
+    Cartesian y, inverting the read-side sign flip.
+
+    ``r1``/``r2`` are the annulus radii at the section's LE/TE in the
+    same units as the points. When given, the per-point Z is computed
+    from the local radius and the Cartesian y -
+    ``z = sqrt(R(x)^2 - y^2)`` with R(x) interpolated linearly from r1
+    to r2 over the section's axial span (constant R when r2 is None).
+    Without radii the constant ``z`` (default 0) is written.
+
+    ``units`` may be a NUMECA scale factor or a common unit name such as
+    ``"m"`` or ``"mm"``.
     """
     ss = np.atleast_2d(np.asarray(ss, dtype=float))
     ps = np.atleast_2d(np.asarray(ps, dtype=float))
@@ -402,6 +421,18 @@ def write_geomturbo(path, ss, ps, z=0.0, units="m"):
         units = float(units)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"unsupported geomTurbo units value: {units!r}") from exc
+
+    def z_values(points):
+        r1f = float(r1) if r1 is not None else 0.0
+        if r1f <= 0.0:
+            return np.full(len(points), float(z))
+        r2f = float(r2) if r2 is not None else r1f
+        x = points[:, 0]
+        x_le, x_te = float(x.min()), float(x.max())
+        t = np.clip((x - x_le) / max(x_te - x_le, 1e-12), 0.0, 1.0)
+        radius = r1f + (r2f - r1f) * t
+        return np.sqrt(np.clip(radius * radius - points[:, 1] ** 2,
+                               0.0, None))
 
     lines = [
         "TYPE GEOMTURBO",
@@ -419,10 +450,12 @@ def write_geomturbo(path, ss, ps, z=0.0, units="m"):
     ]
 
     def add_side(name, points):
+        zvals = z_values(points)
         lines.extend([name, "SECTIONAL", "1", "# SECTION 1", "XYZ",
                       str(len(points))])
-        lines.extend(f"{z:.9f} {y:.9f} {x:.9f}"
-                     for x, y in points[:, :2])
+        # native row order: Z, -Y, X
+        lines.extend(f"{zv:.9f} {-y:.9f} {x:.9f}"
+                     for zv, (x, y) in zip(zvals, points[:, :2]))
 
     add_side("suction", ss)
     add_side("pressure", ps)

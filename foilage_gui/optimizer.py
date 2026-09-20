@@ -66,8 +66,6 @@ OBJECTIVES = [
      "label": "Corrected flow, inlet [kg/(s.m)]", "sense": "max"},
     {"path": "outlet.corrected_flow_kg_s_m",
      "label": "Corrected flow, outlet [kg/(s.m)]", "sense": "max"},
-    {"path": "forces.CL", "label": "Lift coefficient CL", "sense": "max"},
-    {"path": "forces.CD", "label": "Drag coefficient CD", "sense": "min"},
     {"path": "fields.max_mach", "label": "Max Mach number", "sense": "min"},
     {"path": "wall.yplus_median", "label": "Wall y+ (median)", "sense": "min"},
     {"path": "convergence.iterations_run",
@@ -76,6 +74,14 @@ OBJECTIVES = [
      "label": "Mass-flow imbalance [%]", "sense": "min"},
     {"path": "geometry.pitch_to_chord",
      "label": "Pitch-to-chord (PTC)", "sense": "min"},
+]
+
+# External-airfoil coefficients are meaningful optimization quantities for a
+# freestream case.  Keep them out of the cascade catalog: cascade runs use
+# passage quantities such as loss, turning, and corrected flow instead.
+FREESTREAM_OBJECTIVES = [
+    {"path": "forces.LD", "label": "Lift-to-drag ratio L/D (CL/CD)",
+     "sense": "max"},
 ]
 
 # Quantities that can be *constrained* (bound with >= or <=): everything
@@ -92,6 +98,20 @@ CONSTRAINT_QUANTITIES = OBJECTIVES + [
     {"path": "geometry.pitch_le_cax",
      "label": "Pitch LE [c_ax]", "sense": None},
 ]
+
+FREESTREAM_CONSTRAINT_QUANTITIES = FREESTREAM_OBJECTIVES
+
+
+def objectives_for_case(freestream=False):
+    """Return the output-objective catalog for the selected flow mode."""
+    return list(OBJECTIVES) + (list(FREESTREAM_OBJECTIVES)
+                               if freestream else [])
+
+
+def constraint_quantities_for_case(freestream=False):
+    """Return the output-constraint catalog for the selected flow mode."""
+    return list(CONSTRAINT_QUANTITIES) + (
+        list(FREESTREAM_CONSTRAINT_QUANTITIES) if freestream else [])
 
 # pyturbo generator parameters offered as design variables; suggested
 # bounds come from the input.json schema, the "avg" default is filled by

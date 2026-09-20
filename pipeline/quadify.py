@@ -16,7 +16,20 @@ from pathlib import Path
 
 import numpy as np
 
-MARKERS = ("airfoil", "inlet", "outlet", "periodic_bottom", "periodic_top")
+PERIODIC_MARKERS = ("airfoil", "inlet", "outlet", "periodic_bottom",
+                    "periodic_top")
+FREESTREAM_MARKERS = ("airfoil", "inlet", "outlet", "farfield")
+
+# Keep the historical name for callers that need the periodic layout.  The
+# active layout is selected from the physical groups in the Gmsh mesh below.
+MARKERS = PERIODIC_MARKERS
+
+
+def _marker_layout(physical_names):
+    """Return the solver marker layout represented by Gmsh physical groups."""
+    if "farfield" in set(physical_names):
+        return FREESTREAM_MARKERS
+    return PERIODIC_MARKERS
 
 
 def extract_gmsh_recombined(prefix):
@@ -25,14 +38,21 @@ def extract_gmsh_recombined(prefix):
 
     Markers come straight from the gmsh physical groups; line elements are
     re-oriented to SU2's 2D convention (fluid on the left): airfoil loop
-    clockwise, inlet/outlet/periodic edges follow the counter-clockwise
-    border (inlet down, outlet up, bottom +x, top -x).
+    clockwise, inlet/outlet and outer boundaries follow the counter-clockwise
+    border (inlet down, outlet up, lower +x, upper -x).
     """
     import gmsh
 
     gmsh.initialize()
     gmsh.option.setNumber("General.Terminal", 0)
     gmsh.open(str(prefix) + ".msh")
+
+    physical_names = [
+        gmsh.model.getPhysicalName(dim, tag)
+        for dim, tag in gmsh.model.getPhysicalGroups(1)
+    ]
+    marker_names = _marker_layout(physical_names)
+    marker_index = {name: i for i, name in enumerate(marker_names)}
 
     node_tags, coords, _ = gmsh.model.mesh.getNodes()
     coords = coords.reshape(-1, 3)
@@ -48,15 +68,14 @@ def extract_gmsh_recombined(prefix):
         (quads if nn == 4 else tris).extend(cells)
 
     marker_lines = []
-    wanted = {"airfoil", "inlet", "outlet",
-              "periodic_bottom", "periodic_top"}
+    wanted = set(marker_names)
     for dim, ptag in gmsh.model.getPhysicalGroups(1):
         if dim != 1:
             continue
         name = gmsh.model.getPhysicalName(dim, ptag)
         if name not in wanted:
             continue
-        mi = MARKERS.index(name)
+        mi = marker_index[name]
         edges = []
         for ent in gmsh.model.getEntitiesForPhysicalGroup(dim, ptag):
             et1, _, en1 = gmsh.model.mesh.getElements(1, ent)
@@ -101,11 +120,17 @@ def extract_gmsh_recombined(prefix):
         "leftover_tris": int(len(tris)),
         "min_corner_angle_deg": float(np.degrees(ang.min())),
     }
-    for i, m in enumerate(MARKERS):
-        stats[m] = sum(1 for ml in marker_lines if ml[0] == i)
+    marker_counts = {
+        m: sum(1 for ml in marker_lines if ml[0] == i)
+        for i, m in enumerate(marker_names)
+    }
+    stats.update(marker_counts)
+    stats["markers"] = marker_counts
 
-    _write_su2(verts, q, tris, marker_lines, str(prefix) + "_quad.su2")
-    _write_msh2(verts, q, tris, marker_lines, str(prefix) + "_quad.msh")
+    _write_su2(verts, q, tris, marker_lines, str(prefix) + "_quad.su2",
+               marker_names)
+    _write_msh2(verts, q, tris, marker_lines, str(prefix) + "_quad.msh",
+                marker_names)
     _write_obj(verts, q, tris, str(prefix) + "_quad.obj")
     return stats
 
@@ -117,7 +142,8 @@ def _orient_marker(verts, name, edges):
         inlet (left border)   -> top to bottom
         outlet (right border) -> bottom to top
         periodic_bottom       -> +x     periodic_top -> -x
-    (the last four keep the outer border counter-clockwise)
+        farfield            -> lower +x, upper -x
+    (the outer boundary paths keep the fluid on their left)
     """
     from collections import defaultdict
 
@@ -149,6 +175,13 @@ def _orient_marker(verts, name, edges):
             chain.insert(0, nb)
         chains.append(chain)
 
+    farfield_y = None
+    if name == "farfield":
+        farfield_y = [float(np.mean(verts[chain[:-1], 1]))
+                      for chain in chains if len(chain) > 1]
+        y_mid = 0.5 * (min(farfield_y) + max(farfield_y)) \
+            if farfield_y else 0.0
+
     out = []
     for chain in chains:
         if len(chain) < 2:
@@ -167,6 +200,15 @@ def _orient_marker(verts, name, edges):
                 chain = chain[::-1]
             elif name == "periodic_top" and first[0] < last[0]:
                 chain = chain[::-1]
+            elif name == "farfield":
+                # Gmsh stores both outer chains in one physical group. SU2's
+                # positive-fluid-side convention requires lower +x and upper
+                # -x, just like the two separate periodic markers.
+                lower = float(np.mean(verts[chain[:-1], 1])) <= y_mid
+                wrong_way = ((lower and first[0] > last[0]) or
+                             (not lower and first[0] < last[0]))
+                if wrong_way:
+                    chain = chain[::-1]
         seq = (list(zip(chain[:-1], chain[1:])) if not closed
                else list(zip(chain[:-1], chain[1:])))
         out += seq
@@ -212,7 +254,8 @@ def _quad_metrics(verts, quads):
     return min_ang, area, nonconvex, min_edge, max_ang
 
 
-def _write_su2(verts, quads, fill_tris, marker_lines, path):
+def _write_su2(verts, quads, fill_tris, marker_lines, path,
+               marker_names=MARKERS):
     with open(path, "w") as f:
         f.write("NDIME= 2\n")
         f.write(f"NELEM= {len(quads) + len(fill_tris)}\n")
@@ -223,8 +266,8 @@ def _write_su2(verts, quads, fill_tris, marker_lines, path):
         f.write(f"NPOIN= {len(verts)}\n")
         for i, (x, y) in enumerate(verts):
             f.write(f"{x:.17g} {y:.17g} {i}\n")
-        f.write(f"NMARK= {len(MARKERS)}\n")
-        for mi, marker in enumerate(MARKERS):
+        f.write(f"NMARK= {len(marker_names)}\n")
+        for mi, marker in enumerate(marker_names):
             lines = [ml for ml in marker_lines if ml[0] == mi]
             f.write(f"MARKER_TAG= {marker}\n")
             f.write(f"MARKER_ELEMS= {len(lines)}\n")
@@ -232,8 +275,10 @@ def _write_su2(verts, quads, fill_tris, marker_lines, path):
                 f.write(f"3 {a} {b}\n")
 
 
-def _write_msh2(verts, quads, fill_tris, marker_lines, path):
-    phys = [(2, 1, "fluid")] + [(1, 2 + i, m) for i, m in enumerate(MARKERS)]
+def _write_msh2(verts, quads, fill_tris, marker_lines, path,
+                marker_names=MARKERS):
+    phys = [(2, 1, "fluid")] + [
+        (1, 2 + i, m) for i, m in enumerate(marker_names)]
     with open(path, "w") as f:
         f.write("$MeshFormat\n2.2 0 8\n$EndMeshFormat\n")
         f.write(f"$PhysicalNames\n{len(phys)}\n")

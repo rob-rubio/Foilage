@@ -31,6 +31,46 @@ def true_chord(ss, ps):
     return float(np.linalg.norm(te - le))
 
 
+def metal_angles(ss, ps):
+    """Inlet/exit metal angles [deg] of the blade section, measured from
+    the +x (axial) direction.
+
+    Each angle is the direction of the mean of the suction- and
+    pressure-side surface tangents at the shared LE (first) and TE
+    (last) points - the geometric stand-in for the flow angles that the
+    classic Zweifel criterion needs. Returns (alpha1_deg, alpha2_deg):
+    for a conventionally cambered turbine blade alpha1 > 0 and
+    alpha2 < 0.
+    """
+    ss, ps = np.asarray(ss, dtype=float), np.asarray(ps, dtype=float)
+
+    def _tangent(side, first):
+        seg = side[1] - side[0] if first else side[-1] - side[-2]
+        return seg / (np.linalg.norm(seg) + 1e-30)
+
+    inlet = 0.5 * (_tangent(ss, True) + _tangent(ps, True))
+    exit_ = 0.5 * (_tangent(ss, False) + _tangent(ps, False))
+    return (float(math.degrees(math.atan2(inlet[1], inlet[0]))),
+            float(math.degrees(math.atan2(exit_[1], exit_[0]))))
+
+
+def zweifel_geometric(s_over_bx, alpha1_deg, alpha2_deg):
+    """Geometric Zweifel loading predictor (classic incompressible form)
+
+        Zw_geo = 2 (s/bx) cos^2(a2) (tan a1 - tan a2)
+
+    with the metal angles from metal_angles() standing in for the flow
+    angles and s/bx the pitch-to-axial-chord ratio (s may be the pitch
+    at the throat). Design reference: Zw ~ 0.8 traditionally indicates
+    near-optimal solidity; values far above it flag an over-loaded
+    passage. Purely geometric - no CFD solution required.
+    """
+    a1 = math.radians(alpha1_deg)
+    a2 = math.radians(alpha2_deg)
+    return float(2.0 * s_over_bx * math.cos(a2) ** 2
+                 * (math.tan(a1) - math.tan(a2)))
+
+
 def channel_widths(ss, ps, pitch, ss_upper):
     """Width of the blade-to-blade channel.
 

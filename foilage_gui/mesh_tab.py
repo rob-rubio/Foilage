@@ -25,7 +25,7 @@ from .widgets import FieldWidget, ScrolledFrame  # noqa: E402
 
 MARKER_COLORS = {"airfoil": "#111111", "inlet": "#1f77b4",
                  "outlet": "#d62728", "periodic_bottom": "#2ca02c",
-                 "periodic_top": "#2ca02c"}
+                 "periodic_top": "#2ca02c", "farfield": "#9467bd"}
 
 
 class MeshTab(ttk.Frame):

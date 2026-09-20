@@ -50,10 +50,10 @@ if str(REPO) not in sys.path:
 
 from foilage_config import resolve_su2_executable   # noqa: E402
 
-from .optimizer import (ALGORITHMS, CAGE_DV_DEFAULT_BOUND, CONSTRAINT_QUANTITIES,
-                        OBJECTIVES, OptimizationRun, design_variables_for,
-                        front_ids, sanitize_name,
-                        validate_state)  # noqa: E402
+from .optimizer import (ALGORITHMS, CAGE_DV_DEFAULT_BOUND,
+                        OptimizationRun, constraint_quantities_for_case,
+                        design_variables_for, front_ids, objectives_for_case,
+                        sanitize_name, validate_state)  # noqa: E402
 from .widgets import ScrolledFrame, Tooltip        # noqa: E402
 
 POLL_MS = 150
@@ -132,90 +132,16 @@ class OptimizationTab(ttk.Frame):
         scroll.pack(fill="both", expand=True)
         panel = scroll.inner
 
-        obj_box = ttk.LabelFrame(
+        self.obj_box = ttk.LabelFrame(
             panel, text=" Objectives (postprocessed results.json values) ")
-        obj_box.pack(fill="x", padx=6, pady=(6, 3))
-        hdr = ttk.Frame(obj_box)
-        hdr.pack(fill="x", padx=4)
-        tk.Label(hdr, text="", width=2).pack(side="left")
-        tk.Label(hdr, text="quantity", width=30, anchor="w").pack(side="left")
-        tk.Label(hdr, text="minimize", font=("TkDefaultFont", 8)).pack(
-            side="left", padx=(24, 0))
-        tk.Label(hdr, text="maximize", font=("TkDefaultFont", 8)).pack(
-            side="left", padx=(8, 0))
-        self.obj_vars = {}
-        for obj in OBJECTIVES:
-            row = ttk.Frame(obj_box)
-            row.pack(fill="x", padx=4)
-            check = tk.BooleanVar(value=False)
-            sense = tk.StringVar(value=obj["sense"])
-            cb = ttk.Checkbutton(row, variable=check,
-                                 command=lambda o=obj: self._obj_toggled(o))
-            cb.pack(side="left")
-            tk.Label(row, text=obj["label"], width=30, anchor="w",
-                     font=("TkDefaultFont", 9)).pack(side="left")
-            rb_min = ttk.Radiobutton(row, text="", value="min",
-                                     variable=sense)
-            rb_max = ttk.Radiobutton(row, text="", value="max",
-                                     variable=sense)
-            rb_min.pack(side="left", padx=(38, 0))
-            rb_max.pack(side="left", padx=(14, 0))
-            Tooltip(cb, f"results.json key: {obj['path']}")
-            self.obj_vars[obj["path"]] = {
-                "check": check, "sense": sense,
-                "radios": (rb_min, rb_max), "spec": obj}
-        note = tk.Label(
-            obj_box, justify="left", wraplength=PANEL_W - 40,
-            font=("TkDefaultFont", 8), fg="#595959",
-            text="Several objectives give a Pareto-front optimization; "
-                 "a single objective is plotted as fitness vs evaluation.")
-        note.pack(fill="x", padx=4, pady=(2, 3))
+        self.obj_box.pack(fill="x", padx=6, pady=(6, 3))
 
-        con_box = ttk.LabelFrame(
+        self.con_box = ttk.LabelFrame(
             panel, text=" Constraints (bound on a results.json quantity) ")
-        con_box.pack(fill="x", padx=6, pady=3)
-        hdr = ttk.Frame(con_box)
-        hdr.pack(fill="x", padx=4)
-        tk.Label(hdr, text="", width=2).pack(side="left")
-        tk.Label(hdr, text="quantity", width=26, anchor="w").pack(side="left")
-        tk.Label(hdr, text="min (>=)", font=("TkDefaultFont", 8)).pack(
-            side="left", padx=(10, 0))
-        tk.Label(hdr, text="max (<=)", font=("TkDefaultFont", 8)).pack(
-            side="left", padx=(12, 0))
+        self.con_box.pack(fill="x", padx=6, pady=3)
+        self.obj_vars = {}
         self.con_vars = {}
-        for con in CONSTRAINT_QUANTITIES:
-            row = ttk.Frame(con_box)
-            row.pack(fill="x", padx=4)
-            check = tk.BooleanVar(value=False)
-            cb = ttk.Checkbutton(row, variable=check,
-                                 command=lambda c=con: self._con_toggled(c))
-            cb.pack(side="left")
-            tk.Label(row, text=con["label"], width=26, anchor="w",
-                     font=("TkDefaultFont", 9)).pack(side="left")
-            entries = []
-            vars = {"check": check, "spec": con}
-            for key in ("min", "max"):
-                var = tk.StringVar()
-                e = tk.Entry(row, textvariable=var, width=8, justify="right",
-                             font=("Consolas", 9), relief="solid", bd=1,
-                             state="disabled")
-                e.pack(side="left", padx=(6, 0))
-                entries.append(e)
-                vars[key] = var
-            vars["min_entry"], vars["max_entry"] = entries
-            Tooltip(cb, f"results.json key: {con['path']}. Keep the "
-                        f"quantity within [min, max]; leave a field blank "
-                        f"for no bound on that side. Evaluations outside "
-                        f"the bounds stay in the search (Deb's constrained "
-                        f"domination) but never enter the Pareto front.")
-            self.con_vars[con["path"]] = vars
-        con_note = tk.Label(
-            con_box, justify="left", wraplength=PANEL_W - 40,
-            font=("TkDefaultFont", 8), fg="#595959",
-            text="Examples: 'Throat width' min 0.25 rejects narrower "
-                 "throats; a corrected-flow min AND max keeps the operating "
-                 "point inside a band.")
-        con_note.pack(fill="x", padx=4, pady=(2, 3))
+        self._build_output_quantity_panels()
 
         self.dv_box = ttk.LabelFrame(
             panel, text=" Design variables (geometry to explore) ")
@@ -357,6 +283,128 @@ class OptimizationTab(ttk.Frame):
 
     # ------------------------------------------------------------ helpers
     @staticmethod
+    def _config_is_freestream(config):
+        return (config.get("domain", {}).get("periodicity") or
+                "axisymmetric") == "freestream"
+
+    def _is_freestream_case(self):
+        if self._loaded_state:
+            return self._config_is_freestream(
+                self._loaded_state.get("base_config") or {})
+        return (self.app.state.get("domain.periodicity") or "axisymmetric") \
+            == "freestream"
+
+    def _build_output_quantity_panels(self):
+        """Build mode-specific objective and constraint rows.
+
+        The force coefficients are intentionally added only for freestream
+        cases, where CL/CD are the natural external-airfoil outputs.  Preserve
+        any selections that remain valid when the mode changes.
+        """
+        old_obj = {
+            path: (v["check"].get(), v["sense"].get())
+            for path, v in getattr(self, "obj_vars", {}).items()
+        }
+        old_con = {
+            path: (v["check"].get(), v["min"].get(), v["max"].get())
+            for path, v in getattr(self, "con_vars", {}).items()
+        }
+        for box in (self.obj_box, self.con_box):
+            for child in box.winfo_children():
+                child.destroy()
+
+        hdr = ttk.Frame(self.obj_box)
+        hdr.pack(fill="x", padx=4)
+        tk.Label(hdr, text="", width=2).pack(side="left")
+        tk.Label(hdr, text="quantity", width=30, anchor="w").pack(side="left")
+        tk.Label(hdr, text="minimize", font=("TkDefaultFont", 8)).pack(
+            side="left", padx=(24, 0))
+        tk.Label(hdr, text="maximize", font=("TkDefaultFont", 8)).pack(
+            side="left", padx=(8, 0))
+        self.obj_vars = {}
+        for obj in objectives_for_case(self._is_freestream_case()):
+            row = ttk.Frame(self.obj_box)
+            row.pack(fill="x", padx=4)
+            check = tk.BooleanVar(value=old_obj.get(obj["path"],
+                                                    (False, obj["sense"]))[0])
+            sense = tk.StringVar(value=old_obj.get(obj["path"],
+                                                   (False, obj["sense"]))[1])
+            cb = ttk.Checkbutton(row, variable=check,
+                                 command=lambda o=obj: self._obj_toggled(o))
+            cb.pack(side="left")
+            tk.Label(row, text=obj["label"], width=30, anchor="w",
+                     font=("TkDefaultFont", 9)).pack(side="left")
+            rb_min = ttk.Radiobutton(row, text="", value="min",
+                                     variable=sense)
+            rb_max = ttk.Radiobutton(row, text="", value="max",
+                                     variable=sense)
+            rb_min.pack(side="left", padx=(38, 0))
+            rb_max.pack(side="left", padx=(14, 0))
+            if not check.get():
+                rb_min.configure(state="disabled")
+                rb_max.configure(state="disabled")
+            Tooltip(cb, f"results.json key: {obj['path']}")
+            self.obj_vars[obj["path"]] = {
+                "check": check, "sense": sense,
+                "radios": (rb_min, rb_max), "spec": obj}
+        note = tk.Label(
+            self.obj_box, justify="left", wraplength=PANEL_W - 40,
+            font=("TkDefaultFont", 8), fg="#595959",
+            text=("Several objectives give a Pareto-front optimization; "
+                  "a single objective is plotted as fitness vs evaluation. "
+                  "Freestream mode adds lift-to-drag ratio L/D."))
+        note.pack(fill="x", padx=4, pady=(2, 3))
+
+        hdr = ttk.Frame(self.con_box)
+        hdr.pack(fill="x", padx=4)
+        tk.Label(hdr, text="", width=2).pack(side="left")
+        tk.Label(hdr, text="quantity", width=26, anchor="w").pack(side="left")
+        tk.Label(hdr, text="min (>=)", font=("TkDefaultFont", 8)).pack(
+            side="left", padx=(10, 0))
+        tk.Label(hdr, text="max (<=)", font=("TkDefaultFont", 8)).pack(
+            side="left", padx=(12, 0))
+        self.con_vars = {}
+        for con in constraint_quantities_for_case(self._is_freestream_case()):
+            row = ttk.Frame(self.con_box)
+            row.pack(fill="x", padx=4)
+            previous = old_con.get(con["path"], (False, "", ""))
+            check = tk.BooleanVar(value=previous[0])
+            cb = ttk.Checkbutton(row, variable=check,
+                                 command=lambda c=con: self._con_toggled(c))
+            cb.pack(side="left")
+            tk.Label(row, text=con["label"], width=26, anchor="w",
+                     font=("TkDefaultFont", 9)).pack(side="left")
+            entries = []
+            vars = {"check": check, "spec": con}
+            for value in previous[1:]:
+                var = tk.StringVar(value=value)
+                e = tk.Entry(row, textvariable=var, width=8, justify="right",
+                             font=("Consolas", 9), relief="solid", bd=1,
+                             state="normal" if check.get() else "disabled")
+                e.pack(side="left", padx=(6, 0))
+                entries.append(e)
+                vars["min" if len(entries) == 1 else "max"] = var
+            vars["min_entry"], vars["max_entry"] = entries
+            Tooltip(cb, f"results.json key: {con['path']}. Keep the "
+                        f"quantity within [min, max]; leave a field blank "
+                        f"for no bound on that side. Evaluations outside "
+                        f"the bounds stay in the search (Deb's constrained "
+                        f"domination) but never enter the Pareto front.")
+            self.con_vars[con["path"]] = vars
+        con_note = tk.Label(
+            self.con_box, justify="left", wraplength=PANEL_W - 40,
+            font=("TkDefaultFont", 8), fg="#595959",
+            text=("Examples: 'Throat width' min 0.25 rejects narrower "
+                  "throats; a corrected-flow min AND max keeps the operating "
+                  "point inside a band. Freestream mode also supports an "
+                  "L/D bound."))
+        con_note.pack(fill="x", padx=4, pady=(2, 3))
+        n = sum(v["check"].get() for v in self.obj_vars.values())
+        self.status_var.set(
+            f"{n} objective(s) selected" if n else
+            "select objectives and design variables, then Start")
+
+    @staticmethod
     def _fmt(v):
         if isinstance(v, float):
             s = f"{v:.6g}"
@@ -424,6 +472,9 @@ class OptimizationTab(ttk.Frame):
         the morph lattice changes (the catalog is source-specific)."""
         if self.opt_running:
             return
+        if "domain.periodicity" in paths:
+            self._build_output_quantity_panels()
+            self._sync_axis_choices()
         if not any(p in ("airfoil_source.type", "airfoil_source.morph.n")
                    for p in paths):
             return
@@ -781,6 +832,7 @@ class OptimizationTab(ttk.Frame):
             return
         self._loaded_state = state
         self._loaded_path = Path(path)
+        self._build_output_quantity_panels()
         self._apply_state_to_form(state)
         self.records = list(state["records"])
         self.plot_objectives = list(state["objectives"])
