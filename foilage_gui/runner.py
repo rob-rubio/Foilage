@@ -126,20 +126,63 @@ class Job:
             raise StageFailed(f"exit code {rc}")
 
     def _patch_restart(self, stage):
-        """Point the solve cfg at restart.dat (RESTART_SOL= YES)."""
-        cfg_path = Path(stage["cwd"]) / "turbine.cfg"
+        """Point the solve cfg at restart.dat (RESTART_SOL= YES).
+
+        SU2 v8 also needs the restart-input filenames pinned: their
+        defaults are 'solution.dat', while every solve writes
+        'restart.dat' - without this the warm start cannot find the
+        file."""
+        case_dir = Path(stage["cwd"])
+        self._check_restart_matches_mesh(case_dir)
+        cfg_path = case_dir / "turbine.cfg"
         try:
             text = cfg_path.read_text()
-            if "RESTART_SOL" in text:
-                text = re.sub(r"(?m)^RESTART_SOL=.*$", "RESTART_SOL= YES",
-                              text)
-            else:
-                text = text.rstrip("\n") + "\nRESTART_SOL= YES\n"
+            for opt, val in (("RESTART_SOL", "YES"),
+                             ("RESTART_FILENAME", "restart.dat"),
+                             ("SOLUTION_FILENAME", "restart.dat")):
+                if re.search(rf"(?m)^{opt}=", text):
+                    text = re.sub(rf"(?m)^{opt}=.*$", f"{opt}= {val}", text)
+                else:
+                    text = text.rstrip("\n") + f"\n{opt}= {val}\n"
             cfg_path.write_text(text)
-            self._emit("log", line=f"[restart] RESTART_SOL= YES written to "
-                                   f"{cfg_path.name}\n")
+            self._emit("log", line=f"[restart] RESTART_SOL= YES, "
+                                   f"restart files -> restart.dat "
+                                   f"({cfg_path.name})\n")
         except OSError as e:
             self._emit("log", line=f"[restart] could not patch cfg: {e}\n")
+
+    @staticmethod
+    def _restart_rows(path):
+        """Data rows in an ASCII SU2 restart file (lines minus header)."""
+        with open(path, "r", errors="replace") as f:
+            return max(sum(1 for _ in f) - 1, 0)
+
+    @staticmethod
+    def _mesh_node_count(path):
+        with open(path, "r", errors="replace") as f:
+            for line in f:
+                if line.startswith("NNODES="):
+                    return int(line.split("=")[1].strip())
+        return None
+
+    def _check_restart_matches_mesh(self, case_dir):
+        """A restart.dat written for a different mesh (the geometry changed
+        since the last solve) makes SU2 die with a cryptic size error -
+        fail the stage here with an actionable message instead."""
+        restart, mesh = case_dir / "restart.dat", case_dir / "mesh.su2"
+        if not restart.exists() or not mesh.exists():
+            return
+        try:
+            rows = self._restart_rows(restart)
+            nodes = self._mesh_node_count(mesh)
+        except (OSError, ValueError):
+            return
+        if nodes and rows and rows != nodes:
+            raise StageFailed(
+                f"restart.dat holds {rows} points but mesh.su2 has {nodes} "
+                "- it was written for a different mesh. Turn 'Initialize "
+                "from previous solution' off and re-run the case once (or "
+                "restore a matching restart.dat).")
 
     def _spawn_watchdog(self, stage):
         case_dir = stage["case_dir"]

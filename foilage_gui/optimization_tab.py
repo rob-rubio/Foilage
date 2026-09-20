@@ -12,7 +12,9 @@ sections (optimizing cage offsets enables the morph for every evaluated
 case).
 Right: live plot - Pareto front when several objectives are selected,
 best fitness vs evaluation (or generation) when a single objective is -
-plus a run log.
+plus a run log. A second page ("SU2 line convergence") follows the
+evaluation currently in flight: rms residual lines and the Yp (or CL/CD)
+convergence, read live from that case's history.csv.
 
 Start launches an optimizer.OptimizationRun in a worker thread: every
 individual is a full pipeline case (mesh, setup, SU2 solve, post-process)
@@ -40,6 +42,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import matplotlib
 matplotlib.use("TkAgg")
+import numpy as np
 from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
                                                NavigationToolbar2Tk)
 from matplotlib.figure import Figure
@@ -47,6 +50,10 @@ from matplotlib.figure import Figure
 REPO = Path(__file__).resolve().parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
+if str(REPO / "tools") not in sys.path:
+    sys.path.insert(0, str(REPO / "tools"))
+
+from run_monitor import HistoryTail                    # noqa: E402
 
 from foilage_config import resolve_su2_executable   # noqa: E402
 
@@ -54,6 +61,7 @@ from .optimizer import (ALGORITHMS, CAGE_DV_DEFAULT_BOUND,
                         OptimizationRun, constraint_quantities_for_case,
                         design_variables_for, front_ids, objectives_for_case,
                         sanitize_name, validate_state)  # noqa: E402
+from .state import get_path                        # noqa: E402
 from .widgets import ScrolledFrame, Tooltip        # noqa: E402
 
 POLL_MS = 150
@@ -74,6 +82,9 @@ class OptimizationTab(ttk.Frame):
         self._cage_amp_var = tk.StringVar(value=str(self._cage_amp))
         self._dv_catalog = self._current_catalog()
         self._dv_sig = self._catalog_sig(self._dv_catalog)
+        # SU2 line convergence of the evaluation currently in flight
+        self._conv_tail = None
+        self._conv_case = None
 
         # ------------------------------------------------------------ bar
         bar = ttk.Frame(self)
@@ -235,7 +246,14 @@ class OptimizationTab(ttk.Frame):
         right = ttk.Frame(pane)
         pane.add(right, weight=3)
 
-        plot_bar = ttk.Frame(right)
+        self.book = ttk.Notebook(right)
+        self.book.pack(fill="both", expand=True)
+        page_opt = ttk.Frame(self.book)
+        self.book.add(page_opt, text=" optimization ")
+        page_conv = ttk.Frame(self.book)
+        self.book.add(page_conv, text=" SU2 line convergence ")
+
+        plot_bar = ttk.Frame(page_opt)
         plot_bar.pack(fill="x")
         tk.Label(plot_bar, text="x axis:").pack(side="left", padx=(4, 2))
         self.xaxis_var = tk.StringVar(value="evaluation #")
@@ -261,12 +279,24 @@ class OptimizationTab(ttk.Frame):
 
         self.fig = Figure(figsize=(7.4, 5.2), dpi=96)
         self.ax = self.fig.add_subplot(111)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=right)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=page_opt)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
-        self.toolbar = NavigationToolbar2Tk(self.canvas, right,
+        self.toolbar = NavigationToolbar2Tk(self.canvas, page_opt,
                                             pack_toolbar=False)
         self.toolbar.update()
         self.toolbar.pack(side="bottom", fill="x")
+
+        # SU2 line-convergence page: the residual lines (and the Yp /
+        # CL-CD convergence) of the evaluation currently in flight
+        self.conv_note = tk.Label(page_conv, text="waiting for an "
+                                  "evaluation ...", anchor="w",
+                                  font=("TkDefaultFont", 8), fg="#595959")
+        self.conv_note.pack(fill="x")
+        self.conv_fig = Figure(figsize=(7.4, 5.2), dpi=96)
+        self.conv_ax_res = self.conv_fig.add_subplot(211)
+        self.conv_ax_obj = self.conv_fig.add_subplot(212)
+        self.conv_canvas = FigureCanvasTkAgg(self.conv_fig, master=page_conv)
+        self.conv_canvas.get_tk_widget().pack(fill="both", expand=True)
 
         log_box = ttk.LabelFrame(right, text=" Run log ")
         log_box.pack(fill="x", padx=4, pady=(0, 4))
@@ -661,10 +691,26 @@ class OptimizationTab(ttk.Frame):
         self._loaded_state = None
         self._loaded_path = None
         self._sync_axis_choices()
+        self._reset_eval_convergence()
         self.run.start()
         self._update_opt_buttons()
         self.folder_btn.configure(state="normal")
         self.app.set_status(status_txt)
+
+    def _reset_eval_convergence(self):
+        """Clear the SU2 line-convergence page for a fresh run."""
+        self._conv_tail = None
+        self._conv_case = None
+        for ax in (self.conv_ax_res, self.conv_ax_obj):
+            ax.clear()
+            ax.grid(True, alpha=0.3)
+        self.conv_ax_res.text(0.5, 0.5, "waiting for an evaluation ...",
+                              transform=self.conv_ax_res.transAxes,
+                              ha="center", fontsize=9, color="0.4")
+        self.conv_note.configure(text="SU2 line convergence - waiting for "
+                                      "an evaluation ...")
+        self.conv_fig.tight_layout()
+        self.conv_canvas.draw_idle()
 
     def _collect(self):
         """Read the form into (objectives, design_vars, options).
@@ -937,7 +983,84 @@ class OptimizationTab(ttk.Frame):
             if self._plot_dirty:
                 self._plot_dirty = False
                 self.redraw()
+        if self._conv_tail is not None:
+            try:
+                added = self._conv_tail.poll()
+            except Exception:
+                added = 0
+            if added:
+                self._draw_eval_convergence()
         self.after(POLL_MS, self._poll)
+
+    # --------------------------------------------- SU2 line convergence
+    def _start_eval_convergence(self, case):
+        """Follow the history.csv of the evaluation now in flight so the
+        'SU2 line convergence' page shows its residual lines live."""
+        self._conv_case = case
+        self._conv_tail = HistoryTail(REPO / "cases" / case / "history.csv")
+        self.conv_note.configure(
+            text=f"SU2 line convergence - {case} (waiting for "
+                 "history.csv ...)")
+        for ax in (self.conv_ax_res, self.conv_ax_obj):
+            ax.clear()
+            ax.grid(True, alpha=0.3)
+        self.conv_ax_res.text(0.5, 0.5, "waiting for history.csv ...",
+                              transform=self.conv_ax_res.transAxes,
+                              ha="center", fontsize=9, color="0.4")
+        self.conv_fig.tight_layout()
+        self.conv_canvas.draw_idle()
+
+    def _draw_eval_convergence(self):
+        """Render the in-flight evaluation's convergence: rms residual
+        lines on top, the loading convergence (Yp for periodic cases,
+        CL/CD for freestream) below - from the eval's own history.csv."""
+        tail = self._conv_tail
+        self.conv_ax_res.clear()
+        self.conv_ax_obj.clear()
+        self.conv_ax_res.grid(True, alpha=0.3)
+        self.conv_ax_obj.grid(True, alpha=0.3)
+        xcol = "Inner_Iter" if "Inner_Iter" in (tail.columns or []) else None
+        x = np.asarray(tail.get(xcol) or [], dtype=float)
+        plotted = False
+        for col in (tail.columns or []):
+            if col.startswith("rms["):
+                self.conv_ax_res.plot(x, tail.get(col), lw=1,
+                                      label=col.replace("rms", "rms "))
+                plotted = True
+        self.conv_ax_res.set_title("SU2 residuals (log10)", fontsize=9,
+                                   loc="left")
+        if plotted:
+            self.conv_ax_res.legend(fontsize=6, ncol=2, loc="upper right")
+        base = self.run.base_config if self.run else {}
+        freestream = (get_path(base, "domain.periodicity")
+                      or "axisymmetric") == "freestream"
+        if freestream:
+            cd, cl = tail.get("CD"), tail.get("CL")
+            if cd:
+                self.conv_ax_obj.plot(x, cd, lw=1.1, color="tab:red",
+                                      label="CD")
+            if cl:
+                self.conv_ax_obj.plot(x, cl, lw=1.1, color="tab:blue",
+                                      label="CL")
+            self.conv_ax_obj.set_title("force coefficients", fontsize=9,
+                                       loc="left")
+        else:
+            p02 = tail.get("Avg_TotalPress(outlet)")
+            p01 = get_path(base, "BCs.inlet.total pressure")
+            p2 = get_path(base, "BCs.outlet.static pressure")
+            if p02 and p01 and p2 and p01 > p2:
+                self.conv_ax_obj.plot(
+                    x, [(p01 - v) / (p01 - p2) for v in p02],
+                    lw=1.2, color="tab:red", label="Yp")
+                self.conv_ax_obj.legend(fontsize=6, loc="upper right")
+            self.conv_ax_obj.set_title("total-pressure loss Yp",
+                                       fontsize=9, loc="left")
+        rows = tail.rows
+        self.conv_note.configure(
+            text=f"SU2 line convergence - {self._conv_case} "
+                 f"({rows} iterations)")
+        self.conv_fig.tight_layout()
+        self.conv_canvas.draw_idle()
 
     def _on_event(self, kind, data):
         if kind == "log":
@@ -951,6 +1074,7 @@ class OptimizationTab(ttk.Frame):
             self.status_var.set(
                 f"running - generation {data['gen']}, evaluating "
                 f"{data['case']} ...")
+            self._start_eval_convergence(data["case"])
         elif kind == "eval_done":
             self.records.append(data["record"])
             self._plot_dirty = True

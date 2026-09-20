@@ -262,6 +262,25 @@ def scale_mesh(path, scale):
         f.write("\n".join(out) + "\n")
 
 
+def restore_warm_start_restart(su2_dir, backup_dir):
+    """Put the archived restart.dat back after the validation run.
+
+    'Initialize from previous solution' warm-starts the following solve
+    from restart.dat - but the validation step both moves that file into
+    the results backup and overwrites/deletes the validate-run's own
+    restart. Restoring the archived copy keeps the warm start working
+    across full (mesh + setup + solve) runs. Returns True when a restart
+    file was restored.
+    """
+    if backup_dir is None:
+        return False
+    candidate = Path(backup_dir) / "restart.dat"
+    if candidate.exists():
+        candidate.replace(Path(su2_dir) / "restart.dat")
+        return True
+    return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mesh_case_dir", type=Path)
@@ -442,6 +461,7 @@ def main():
                    creationflags=CREATE_NO_WINDOW)
 
     # ---- validate periodic pairing + BCs (2 iterations)
+    bdir = None
     if not args.skip_validate:
         # the validate run overwrites history/restart/solution outputs -
         # preserve any previous results first
@@ -476,6 +496,12 @@ def main():
         for f in ("history.csv", "restart.dat", "vol_solution.vtk", "vol_solution.vtu",
                   "surface.vtk", "surface.vtu"):
             (su2_dir / f).unlink(missing_ok=True)
+        # the validate run must not destroy the warm-start state: put the
+        # archived restart.dat back for the 'Initialize from previous
+        # solution' solve that follows this setup
+        if restore_warm_start_restart(su2_dir, bdir):
+            print("[validate] restart.dat restored (warm-start state "
+                  "preserved)")
 
     run_cmd = (f'python tools\\run_monitor.py cases\\{su2_name} '
                f'turbine.cfg -t 6')

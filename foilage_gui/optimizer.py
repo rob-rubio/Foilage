@@ -99,18 +99,51 @@ CONSTRAINT_QUANTITIES = OBJECTIVES + [
      "label": "Pitch LE [c_ax]", "sense": None},
 ]
 
+# Zweifel loading coefficients (results.json "zweifel" block, written by
+# the post-processing plane audit for periodic cascades only - a
+# freestream run has no pitch, so no Zweifel). The classic incompressible
+# criterion and the density-corrected compressible form; the traditional
+# design band is Zw ~ 0.8, so as objectives they default to maximize,
+# while the constraint rows let a target band (e.g. 0.7-0.9) be held.
+ZWEIFEL_QUANTITIES = [
+    {"path": "zweifel.incompressible",
+     "label": "Zweifel incompressible", "sense": "max"},
+    {"path": "zweifel.compressible",
+     "label": "Zweifel compressible", "sense": "max"},
+]
+
+# the geometry-based predictor from the mesh pipeline (metal angles +
+# throat pitch over axial chord) - bandable as a CFD-free constraint
+ZWEIFEL_GEOMETRIC_CONSTRAINT = [
+    {"path": "geometry.zweifel_geometric",
+     "label": "Zweifel (geometric predictor)", "sense": None},
+]
+
 FREESTREAM_CONSTRAINT_QUANTITIES = FREESTREAM_OBJECTIVES
 
 
 def objectives_for_case(freestream=False):
-    """Return the output-objective catalog for the selected flow mode."""
-    return list(OBJECTIVES) + (list(FREESTREAM_OBJECTIVES)
-                               if freestream else [])
+    """Return the output-objective catalog for the selected flow mode.
+
+    The Zweifel loading coefficients are offered for periodic cascades
+    only - freestream runs have no pitch, so no Zweifel is written to
+    results.json."""
+    extra = []
+    if not freestream:
+        extra += ZWEIFEL_QUANTITIES
+    return list(OBJECTIVES) + extra + (list(FREESTREAM_OBJECTIVES)
+                                       if freestream else [])
 
 
 def constraint_quantities_for_case(freestream=False):
-    """Return the output-constraint catalog for the selected flow mode."""
-    return list(CONSTRAINT_QUANTITIES) + (
+    """Return the output-constraint catalog for the selected flow mode.
+
+    Periodic cascades can additionally band the Zweifel loading - the
+    CFD values or the geometric predictor from the mesh pipeline."""
+    extra = []
+    if not freestream:
+        extra += ZWEIFEL_QUANTITIES + ZWEIFEL_GEOMETRIC_CONSTRAINT
+    return list(CONSTRAINT_QUANTITIES) + extra + (
         list(FREESTREAM_CONSTRAINT_QUANTITIES) if freestream else [])
 
 # pyturbo generator parameters offered as design variables; suggested

@@ -4,6 +4,7 @@
 """
 
 import json
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -424,6 +425,17 @@ def test_optimizer():
         c["path"] for c in constraint_quantities_for_case(False)}
     assert "forces.LD" in {
         c["path"] for c in constraint_quantities_for_case(True)}
+    # Zweifel loading: objectives + constraints for periodic cascades,
+    # absent for freestream (no pitch -> no Zweifel in results.json)
+    assert {"zweifel.incompressible", "zweifel.compressible"} <= {
+        o["path"] for o in objectives_for_case(False)}
+    assert not any(p.startswith("zweifel") for p in
+                   {o["path"] for o in objectives_for_case(True)})
+    assert {"zweifel.incompressible", "zweifel.compressible",
+            "geometry.zweifel_geometric"} <= {
+        c["path"] for c in constraint_quantities_for_case(False)}
+    assert not any(p.startswith("zweifel") for p in {
+        c["path"] for c in constraint_quantities_for_case(True)})
 
     from tools.plot_case import lift_to_drag
     assert lift_to_drag(2.4, 0.12) == 20.0
@@ -1101,6 +1113,58 @@ def test_zweifel():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_warm_start_restart():
+    """Warm-start (RESTART_SOL) robustness: the validation step keeps the
+    previous restart.dat, and a restart from a different mesh fails with
+    an actionable message instead of a cryptic SU2 crash."""
+    from setup_cascade_case import restore_warm_start_restart
+    from foilage_gui.runner import Job, StageFailed
+
+    # 1) the validate backup/restore cycle preserves the warm-start file
+    su2 = Path(tempfile.mkdtemp())
+    bdir = su2 / "results_backup_x"
+    bdir.mkdir()
+    (bdir / "restart.dat").write_text('"ID"\n1\n2\n')
+    (su2 / "restart.dat").write_text('"ID"\nvalidate-run-junk\n')
+    assert restore_warm_start_restart(su2, bdir) is True
+    assert "validate-run-junk" not in (su2 / "restart.dat").read_text()
+    assert restore_warm_start_restart(su2, None) is False
+    empty = su2 / "results_backup_empty"
+    empty.mkdir()
+    (su2 / "restart.dat").write_text("kept\n")
+    assert restore_warm_start_restart(su2, empty) is False
+    assert (su2 / "restart.dat").read_text() == "kept\n"
+
+    # 2) the solve stage patches RESTART_SOL plus the restart-input
+    #    filenames (SU2 v8 defaults them to solution.dat) and rejects
+    #    mismatched restart files before SU2 starts
+    job = Job("t", [])
+    case = Path(tempfile.mkdtemp())
+    (case / "turbine.cfg").write_text("SOLVER= RANS\n")
+    (case / "mesh.su2").write_text("NDIME= 2\nNNODES= 5\n")
+    (case / "restart.dat").write_text('"ID"\n1\n2\n3\n4\n5\n')
+    job._patch_restart({"cwd": str(case)})
+    text = (case / "turbine.cfg").read_text()
+    assert "RESTART_SOL= YES" in text
+    assert "RESTART_FILENAME= restart.dat" in text
+    assert "SOLUTION_FILENAME= restart.dat" in text
+    (case / "restart.dat").write_text('"ID"\n1\n2\n3\n4\n5\n6\n7\n')
+    try:
+        job._patch_restart({"cwd": str(case)})
+    except StageFailed as e:
+        assert "different mesh" in str(e), e
+    else:
+        raise AssertionError("mesh/restart mismatch not detected")
+    # no mesh on disk -> check skipped, patch still applied
+    (case / "mesh.su2").unlink()
+    job._patch_restart({"cwd": str(case)})
+    assert "RESTART_FILENAME= restart.dat" in (case / "turbine.cfg").read_text()
+    shutil.rmtree(su2, ignore_errors=True)
+    shutil.rmtree(case, ignore_errors=True)
+    print("warm-start restart OK (validate preserves it, mismatch "
+          "detected before SU2)")
+
+
 def main():
     test_schema()
     test_state_roundtrip()
@@ -1115,6 +1179,7 @@ def main():
     test_optimizer_dvs()
     test_periodicity_modes()
     test_zweifel()
+    test_warm_start_restart()
     test_geomturbo_import()
     test_geomturbo_external_samples()
     test_su2_mesh_reader()
