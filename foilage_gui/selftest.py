@@ -1165,6 +1165,107 @@ def test_warm_start_restart():
           "detected before SU2)")
 
 
+def test_ml():
+    """ML tab building blocks: SQLite sample store, the pure-numpy MLP
+    (train + predict on a synthetic function), and the sampler's input
+    writer (design overrides, morph auto-enable, R1=R2 sync)."""
+    from foilage_gui.ml_store import MLStore
+    from foilage_gui.ml_net import predict as mlp_predict
+    from foilage_gui.ml_net import train_mlp
+    from foilage_gui.ml_runner import MLSamplingRun
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        # ---- store roundtrip
+        store = MLStore(tmp / "ml.db")
+        ds_id = store.create_dataset("d1", ["a", "b"], ["y1", "y2"])
+        assert store.dataset(ds_id)["x_columns"] == ["a", "b"]
+        ids = store.add_samples(ds_id, [{"a": 1.0, "b": 2.0},
+                                        {"a": 3.0, "b": 4.0}])
+        pend = store.pending(ds_id)
+        assert len(pend) == 2 and all(s["status"] == "pending" for s in pend)
+        store.record_result(ids[0], {"y1": 10.0, "y2": 20.0}, "case1")
+        store.record_failure(ids[1], "mesh hang", "case2")
+        assert [s["status"] for s in store.pending(ds_id)] == ["failed"]
+        # importing rows that already carry y fills them immediately
+        store.add_samples(ds_id, [{"a": 5.0, "b": 6.0}],
+                          [{"y1": 1.0, "y2": 2.0}])
+        assert len(store.filled(ds_id)) == 2
+
+        # ---- per-column LHS bounds: persisted with the dataset
+        assert store.dataset(ds_id)["x_bounds"] == {}
+        store.set_x_bounds(ds_id, {"a": (-0.5, 0.5)})
+        assert store.dataset(ds_id)["x_bounds"] == {"a": (-0.5, 0.5)}
+        assert MLStore(tmp / "ml.db").dataset(ds_id)["x_bounds"] == \
+            {"a": (-0.5, 0.5)}          # survives a fresh connection
+        ds3 = store.create_dataset("d3", ["a"], ["y3"],
+                                   x_bounds={"a": (1, 2)})
+        assert store.dataset(ds3)["x_bounds"] == {"a": (1.0, 2.0)}
+
+        # ---- MLP learns a smooth 2-in 2-out function
+        rng = np.random.default_rng(7)
+        X = rng.uniform(0.0, 1.0, size=(140, 2))
+        y = np.column_stack([np.sin(2 * np.pi * X[:, 0]) * X[:, 1],
+                             X[:, 0] + X[:, 1] ** 2])
+        model, info = train_mlp(X, y, hidden=(48, 48), epochs=300,
+                                lr=2e-3, batch=16, val_frac=0.2, seed=3)
+        pred = mlp_predict(model, X)
+        rmse = float(np.sqrt(np.mean((pred - y) ** 2)))
+        assert rmse < 0.05, f"MLP too inaccurate: RMSE {rmse}"
+        assert len(info["history"]) >= 5 and info["val_rmse"] < 0.1
+
+        # ---- sampler input writer: overrides, morph enable, R1=R2
+        base = {"case": {"name": "x", "output_dir": "cases"},
+                "domain": {"R1": 3.0, "R2": 3.0},
+                "airfoil_source": {"type": "geomturbo",
+                                   "morph": {"enabled": False, "n": 2,
+                                             "dx": [0.0] * 4,
+                                             "dy": [0.0] * 4}}}
+        runner = MLSamplingRun(
+            base, tmp / "run", "mltag",
+            [{"airfoil.alpha1": 30.0}],
+            ["airfoil.alpha1"], ["losses.total_pressure_loss_coeff_Yp"])
+        run_dir = runner._write_input(
+            0, {"airfoil.alpha1": 30.0, "airfoil_source.morph.dx@1": 0.05},
+            "mltag_p000")
+        cfgw = json.loads((run_dir / "input.json").read_text())
+        assert cfgw["airfoil"]["alpha1"] == 30.0
+        assert cfgw["airfoil_source"]["morph"]["enabled"] is True
+        assert cfgw["airfoil_source"]["morph"]["dx"][1] == 0.05
+        assert cfgw["domain"]["R2"] == cfgw["domain"]["R1"]
+        assert cfgw["case"]["name"] == "mltag_p000"
+
+        # int-kind X columns are rounded before they reach input.json: a
+        # float blade count / flow-guidance exponent crashes the pipeline
+        runner2 = MLSamplingRun(
+            base, tmp / "run2", "mltag2",
+            [{"domain.airfoil_count": 30.6}],
+            ["domain.airfoil_count", "airfoil.ss_flow_guidance.n"],
+            ["losses.total_pressure_loss_coeff_Yp"],
+            x_kinds={"domain.airfoil_count": "int",
+                     "airfoil.ss_flow_guidance.n": "int"})
+        run_dir2 = runner2._write_input(
+            0, {"domain.airfoil_count": 30.6,
+                "airfoil.ss_flow_guidance.n": 9.7}, "mltag2_p000")
+        cfgw2 = json.loads((run_dir2 / "input.json").read_text())
+        n = cfgw2["domain"]["airfoil_count"]
+        assert isinstance(n, int) and n == 31, n
+        nguid = cfgw2["airfoil"]["ss_flow_guidance"]["n"]
+        assert isinstance(nguid, int) and nguid == 10, nguid
+
+        # dataset deletion removes the dataset and its samples
+        store2 = MLStore(tmp / "ml2.db")
+        ds2 = store2.create_dataset("doomed", ["a"], ["y"])
+        store2.add_samples(ds2, [{"a": 1.0}], [{"y": None}])
+        assert store2.delete_dataset(ds2) is True
+        assert store2.dataset(ds2) is None and store2.samples(ds2) == []
+        assert store2.delete_dataset(ds2) is False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(REPO / "cases" / "mltag_p000", ignore_errors=True)
+    print("ml OK (store roundtrip, MLP train/predict, sampler writer)")
+
+
 def main():
     test_schema()
     test_state_roundtrip()
@@ -1180,6 +1281,7 @@ def main():
     test_periodicity_modes()
     test_zweifel()
     test_warm_start_restart()
+    test_ml()
     test_geomturbo_import()
     test_geomturbo_external_samples()
     test_su2_mesh_reader()

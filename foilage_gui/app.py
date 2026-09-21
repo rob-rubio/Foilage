@@ -41,8 +41,9 @@ class FoilageApp:
         from foilage_gui.mesh_tab import MeshTab
         from foilage_gui.solution_tab import SolutionTab
         from foilage_gui.optimization_tab import OptimizationTab
+        from foilage_gui.ml_tab import MLTab
         for Tab in (GeometryTab, SetupTab, MeshTab, SolutionTab,
-                    OptimizationTab):
+                    OptimizationTab, MLTab):
             tab = Tab(self)
             self.notebook.add(tab, text=f" {Tab.__name__[:-3]} ")
             self._tabs.append(tab)
@@ -160,6 +161,10 @@ class FoilageApp:
         if any(getattr(tab, "opt_running", False) for tab in self._tabs):
             messagebox.showinfo(
                 "Busy", "An optimization is running - stop it first.")
+            return
+        if any(getattr(tab, "sampling_running", False) for tab in self._tabs):
+            messagebox.showinfo(
+                "Busy", "An ML sampling run is active - stop it first.")
             return
         issues = [i for i in self.state.validate() if i[0] == "error"]
         for tab in self._tabs:                       # validate form fields
