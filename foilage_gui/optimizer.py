@@ -102,9 +102,12 @@ CONSTRAINT_QUANTITIES = OBJECTIVES + [
 # Zweifel loading coefficients (results.json "zweifel" block, written by
 # the post-processing plane audit for periodic cascades only - a
 # freestream run has no pitch, so no Zweifel). The classic incompressible
-# criterion and the density-corrected compressible form; the traditional
-# design band is Zw ~ 0.8, so as objectives they default to maximize,
-# while the constraint rows let a target band (e.g. 0.7-0.9) be held.
+# criterion and its compressible form (inlet tangential momentum
+# re-framed on the outlet axial velocity, Vz1/Vz2 = rho2/rho1; the
+# compressible value stays at or below the incompressible one for an
+# accelerating row); the traditional design band is Zw ~ 0.8, so as
+# objectives they default to maximize, while the constraint rows let a
+# target band (e.g. 0.7-0.9) be held.
 ZWEIFEL_QUANTITIES = [
     {"path": "zweifel.incompressible",
      "label": "Zweifel incompressible", "sense": "max"},

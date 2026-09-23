@@ -355,7 +355,12 @@ SECTIONS = [
         FieldSpec("mesh.refine_dist", "Near-wall refinement distance", "float",
                   0.6, 0.05, 2.0, slider=True,
                   tooltip="Distance from the wall over which the mesh "
-                          "refines towards near_wall_size."),
+                          "refines towards near_wall_size. Cannot end "
+                          "inside the boundary-layer stack: a shorter "
+                          "value is stretched just past it (a degenerate "
+                          "Gmsh size ramp would otherwise pin the whole "
+                          "domain to near_wall_size and ignore "
+                          "max_size)."),
         FieldSpec("mesh.periodic_size", "Periodic-edge element size", "float",
                   0.025, 0.002, 0.1, slider=True,
                   tooltip="Edge length along the periodic passage edges."),

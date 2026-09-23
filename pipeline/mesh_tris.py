@@ -307,10 +307,16 @@ def mesh_domain(airfoil, dom_cfg, mesh_cfg, prefix,
         gmsh.model.mesh.field.setNumber(f_thr, "InField", f_dist)
         gmsh.model.mesh.field.setNumber(f_thr, "SizeMin", h_wall)
         gmsh.model.mesh.field.setNumber(f_thr, "SizeMax", h_far)
-        gmsh.model.mesh.field.setNumber(f_thr, "DistMin", 1.5 * thickness)
-        gmsh.model.mesh.field.setNumber(
-            f_thr, "DistMax", mesh_cfg.get("refine_dist", 0.6)
-        )
+        dist_min = 1.5 * thickness
+        # Gmsh's Threshold degenerates to SizeMin everywhere when the ramp
+        # is inverted (DistMax <= DistMin), pinning the whole domain to
+        # near_wall_size and making mesh.max_size a no-op - so a
+        # refine_dist that ends inside the boundary-layer stack is
+        # stretched just past it
+        dist_max = max(float(mesh_cfg.get("refine_dist", 0.6)),
+                       dist_min * 1.05)
+        gmsh.model.mesh.field.setNumber(f_thr, "DistMin", dist_min)
+        gmsh.model.mesh.field.setNumber(f_thr, "DistMax", dist_max)
         fields.append(f_thr)
 
     wake = mesh_cfg.get("wake")

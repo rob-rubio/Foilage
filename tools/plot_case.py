@@ -877,13 +877,19 @@ def write_results(case_dir, case, fs, dist=None):
         # Zweifel loading coefficients (periodic cascades only). The
         # incompressible form is the classic
         #   Zw = 2 (s/bx) cos^2(a2) (tan a1 - tan a2)
-        # (a1/a2 mass-averaged flow angles from axial, signed); the
-        # compressible form corrects the momentum force by the
-        # inlet/outlet density ratio: Zw_c = Zw * (rho1/rho2)
-        # (e.g. Ni et al. 2024, "Modified Zweifel Coefficient ...",
-        # Aerospace 11(8):650). s = pitch from the periodic translation
-        # (2D) or the TE pitch of the wedge sector (3D), bx = axial chord
-        # (reynolds_length).
+        # (a1/a2 mass-averaged flow angles from axial, signed). The
+        # compressible form re-frames the inlet tangential momentum on
+        # the outlet axial velocity (McQuilling 2007; Babajee & Arts
+        # 2013; Ni et al. 2024, "Modified Zweifel Coefficient and Lift
+        # Coefficient Definition Considering Compressible Effect",
+        # Aerospace 11(8):650, Eqs. (2)-(3)):
+        #   Zw_c = 2 (s/bx) cos^2(a2) (Vz1/Vz2 tan a1 - tan a2)
+        # with Vz1/Vz2 = rho2/rho1 from continuity, so D = Zw - Zw_c =
+        # 2 (s/bx) cos^2(a2) (1 - rho2/rho1) tan a1 >= 0: the
+        # incompressible criterion OVERestimates the loading of an
+        # accelerating (turbine) row, i.e. Zw_c <= Zw. s = pitch from
+        # the periodic translation (2D) or the TE pitch of the wedge
+        # sector (3D), bx = axial chord (reynolds_length).
         pers = cascade.get("periodic") or []
         pitch_m = float((pers[0].get("translation") or [0, 0, 0])[1] or 0.0) \
             if pers else 0.0
@@ -896,13 +902,18 @@ def write_results(case_dir, case, fs, dist=None):
         if pitch_m > 0.0 and bx_m > 0.0 and \
                 abs(90.0 - abs(a1)) > 1.0 and abs(90.0 - abs(a2)) > 1.0:
             sbx = pitch_m / bx_m
-            zw_inc = 2.0 * sbx * math.cos(math.radians(a2)) ** 2 * \
-                (math.tan(math.radians(a1)) - math.tan(math.radians(a2)))
-            rho_ratio = out["inlet"]["density_kg_m3"] / \
-                out["outlet"]["density_kg_m3"]
+            c2 = math.cos(math.radians(a2)) ** 2
+            t1 = math.tan(math.radians(a1))
+            t2 = math.tan(math.radians(a2))
+            zw_inc = 2.0 * sbx * c2 * (t1 - t2)
+            # continuity (2D, AVDR ~ 1): rho1 Vz1 = rho2 Vz2 -> the
+            # outlet-to-inlet density ratio is the axial-velocity ratio
+            vz_ratio = out["outlet"]["density_kg_m3"] / \
+                out["inlet"]["density_kg_m3"]
+            zw_comp = 2.0 * sbx * c2 * (vz_ratio * t1 - t2)
             out["zweifel"] = {
                 "incompressible": float(zw_inc),
-                "compressible": float(zw_inc * rho_ratio),
+                "compressible": float(zw_comp),
                 "pitch_over_axial_chord": float(sbx),
                 "alpha1_deg": float(a1),
                 "alpha2_deg": float(a2),

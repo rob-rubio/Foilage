@@ -245,6 +245,21 @@ class CaseState:
             issues.append(("warning",
                            "Boundary-layer stack is thicker than ~0.05 "
                            "axial chord; reduce layers or growth rate."))
+        if fl and nlay:
+            growth = float(self.get("mesh.boundary_layer.growth_rate")
+                           or 1.25)
+            thick = fl * (growth ** nlay - 1) / max(growth - 1.0, 1e-9)
+            rd = self.get("mesh.refine_dist")
+            if rd is not None and rd <= 1.5 * thick:
+                issues.append((
+                    "warning",
+                    f"Near-wall refinement distance ({rd:g}) ends inside "
+                    f"the boundary-layer stack (~{1.5 * thick:.3g} axial "
+                    "chord from the wall), so the size ramp to the "
+                    "far-field element size cannot finish there - it is "
+                    "stretched just past the stack. Lower the layer count "
+                    "or first-layer height, or raise refine_dist, if you "
+                    "want the ramp where you asked for it."))
         return issues
 
     # ------------------------------------------------------------- derived

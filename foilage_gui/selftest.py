@@ -122,6 +122,43 @@ def test_validation():
     print("validation OK")
 
 
+def test_mesh_size_fields():
+    """mesh.max_size must drive the far-field element size even when the
+    refine_dist ramp would end inside the boundary-layer stack (Gmsh's
+    Threshold field degenerates to SizeMin everywhere on an inverted
+    DistMax < DistMin ramp, which used to pin the whole domain to
+    near_wall_size and ignore max_size)."""
+    from pipeline.mesh_tris import mesh_domain
+    from foilage_gui.schema import DEFAULTS
+
+    af_cfg = dict(DEFAULTS["airfoil"])
+    af_cfg["n_points"] = 121
+    af_cfg["axial_chord"] = 100.0
+    from pipeline.airfoil import build_geometry
+    airfoil = build_geometry({"airfoil": af_cfg})
+    dom = {"periodicity": "freestream", "y_min": -1.5, "y_max": 1.5,
+           "x_min": -0.5, "x_max": 2.5,
+           "R1": 90.0, "R2": 90.0, "airfoil_count": 45}
+    # BL stack ~0.054 c_ax thick -> DistMin ~0.081, refine_dist 0.05:
+    # inverted ramp (debug_a hit the same regime with a thick stack)
+    mesh_cfg = {"max_size": 0.08, "near_wall_size": 0.006,
+                "refine_dist": 0.05, "algorithm": 6,
+                "boundary_layer": {"first_layer_height": 0.001,
+                                   "growth_rate": 1.25, "n_layers": 12}}
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        fine = dict(mesh_cfg, max_size=0.03)
+        s_fine = mesh_domain(airfoil, dom, fine, str(tmp / "fine"))
+        s_coarse = mesh_domain(airfoil, dom, mesh_cfg, str(tmp / "coarse"))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f"size fields OK (inverted ramp: max 0.03 -> {s_fine['total']} "
+          f"elements, max 0.08 -> {s_coarse['total']})")
+    assert s_coarse["total"] < s_fine["total"] * 0.6, \
+        (f"far-field size ignored: max 0.03 -> {s_fine['total']}, "
+         f"max 0.08 -> {s_coarse['total']}")
+
+
 def test_derived():
     state = CaseState(REPO / "cases" / "turbine_blade_9" / "input.json")
     d = state.derived()
@@ -1174,11 +1211,25 @@ def test_zweifel():
         zw = res.get("zweifel")
         assert zw, "no zweifel block for a periodic case"
         assert zw["incompressible"] > 0.0 and zw["compressible"] > 0.0
+        # accelerating turbine row: the compressible criterion must come
+        # out BELOW the incompressible one (Ni et al. 2024, Aerospace
+        # 11(8):650, Eq. (3): D = Zw_inc - Zw_comp >= 0 for Vz2 > Vz1)
+        assert zw["compressible"] < zw["incompressible"], zw
         ratio = zw["compressible"] / zw["incompressible"]
-        assert 0.5 <= ratio <= 3.0, ratio       # rho1/rho2 of a turbine
+        assert 0.5 <= ratio < 1.0, ratio
         assert zw["alpha1_deg"] > 0.0 > zw["alpha2_deg"]
+        # exact recompute from the stored plane audit:
+        #   Zw_c = 2 (s/bx) cos^2(a2) (rho2/rho1 tan a1 - tan a2)
+        import math
+        vz = res["outlet"]["density_kg_m3"] / res["inlet"]["density_kg_m3"]
+        a1r = math.radians(zw["alpha1_deg"])
+        a2r = math.radians(zw["alpha2_deg"])
+        zw_c = 2.0 * zw["pitch_over_axial_chord"] * math.cos(a2r) ** 2 * \
+            (vz * math.tan(a1r) - math.tan(a2r))
+        assert abs(zw_c - zw["compressible"]) < 1e-9, \
+            (zw_c, zw["compressible"])
         print(f"zweifel OK (inc {zw['incompressible']:.3f}, "
-              f"comp {zw['compressible']:.3f}, rho-ratio {ratio:.3f}, "
+              f"comp {zw['compressible']:.3f}, rho2/rho1 {vz:.3f}, "
               f"s/bx {zw['pitch_over_axial_chord']:.3f})")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1580,6 +1631,7 @@ def main():
     test_mesh_profiles()
     test_state_roundtrip()
     test_validation()
+    test_mesh_size_fields()
     test_derived()
     test_gamma_model()
     test_cascade_initialization()
