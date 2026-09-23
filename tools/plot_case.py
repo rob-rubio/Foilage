@@ -132,11 +132,18 @@ def plot_convergence(case_dir, case_name, unsteady=None):
 
 # ------------------------------------------------------------------- fields
 def load_volume(case_dir):
+    """Latest volume solution as (d, d3d): d is the 2D-style dict (for a
+    3D wedge case the mid-span slice), d3d the raw 3D volume (None for
+    genuine 2D cases) used by the inlet/outlet surface audits."""
     # unsteady runs write numbered snapshots; take the latest
     vols = sorted(case_dir.glob("vol_solution*.vtk"))
     if not vols:
         raise FileNotFoundError(f"no vol_solution*.vtk in {case_dir}")
-    return read_legacy_vtk(str(vols[-1]))
+    d = read_legacy_vtk(str(vols[-1]), slice3d=True)
+    d3d = None
+    if d.get("_was3d"):
+        d3d = read_legacy_vtk(str(vols[-1]), slice3d=False)
+    return d, d3d
 
 
 def fields_from_volume(d, gamma=GAMMA, r=R_AIR):
@@ -153,7 +160,8 @@ def fields_from_volume(d, gamma=GAMMA, r=R_AIR):
     for name, arr in d.items():
         if not isinstance(arr, np.ndarray) or arr.ndim != 2:
             continue
-        if name in ("points", "tris", "quads"):
+        if name in ("points", "points3d", "tris", "quads", "hexes",
+                    "prisms"):
             continue
         if name == "Velocity":
             out["Velocity magnitude"] = (
@@ -189,6 +197,41 @@ def volume_triangulation(d):
     return pts, conn
 
 
+def periodic_plot_positions(d, pair=None):
+    """Projected node positions for the passage and its periodic neighbours.
+
+    A 3D wedge has zero translation: its neighbours must be rotated around
+    the machine axis before projecting onto the x-y display plane.
+    """
+    pts = d["points"]
+    if not pair:
+        return [pts]
+    angle = float(pair.get("rotation_deg") or 0.0)
+    pts3 = d.get("points3d")
+    if angle and pts3 is not None:
+        center = np.asarray(pair.get("center", (0.0, 0.0, 0.0)), dtype=float)
+        axis = np.asarray(pair.get("axis", (1.0, 0.0, 0.0)), dtype=float)
+        axis /= np.linalg.norm(axis)
+        rel = np.asarray(pts3, dtype=float) - center
+        along = np.sum(rel * axis, axis=1)[:, None] * axis
+        cross = np.cross(axis, rel)
+        copies = []
+        for degrees in (-abs(angle), 0.0, abs(angle)):
+            if degrees == 0.0:
+                copies.append(pts)
+                continue
+            a = np.radians(degrees)
+            rotated = (center + rel * np.cos(a) + cross * np.sin(a)
+                       + along * (1.0 - np.cos(a)))
+            copies.append(rotated[:, :2])
+        return copies
+    pitch = float((pair.get("translation") or [0.0, 0.0, 0.0])[1] or 0.0)
+    if pitch:
+        return [np.column_stack((pts[:, 0], pts[:, 1] + dy))
+                for dy in (-pitch, 0.0, pitch)]
+    return [pts]
+
+
 def _volume_arrays(d):
     """(pts, conn, mach, cp, vel) from a parsed volume dict (legacy shape)."""
     pts, conn = volume_triangulation(d)
@@ -196,30 +239,102 @@ def _volume_arrays(d):
             d["Velocity"][:, :2])
 
 
-def plot_fields(case_dir, pts, conn, mach, cp, pitch=0.0):
+def _surface_plane_audit(d3d, x_target, gamma, R):
+    """Mass-flow-weighted plane audit over the 3D inlet/outlet face set of
+    a wedge volume mesh: every hex/prism side face lying in the plane
+    x = x_target contributes its mass flux, and per-face centroid values
+    are mass-averaged (analogous to the 2D trapezoidal pitch-line audit,
+    but over the full span)."""
+    pts3 = d3d["points3d"]
+    rho_n = d3d["Pressure"].ravel() / (R * d3d["Temperature"].ravel())
+    vel_n = d3d["Velocity"]
+    mach_n = d3d["Mach"].ravel()
+    p_n = d3d["Pressure"].ravel()
+    p0_n = p_n * (1.0 + 0.5 * (gamma - 1.0) * mach_n ** 2) \
+        ** (gamma / (gamma - 1.0))
+
+    face_sets = []
+    for cells, side_faces in (
+            (d3d.get("hexes"), ((0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6),
+                                (3, 0, 4, 7))),
+            (d3d.get("prisms"), ((0, 1, 4, 3), (1, 2, 5, 4),
+                                 (2, 0, 3, 5)))):
+        if cells is None or not len(cells):
+            continue
+        for f in side_faces:
+            fn = cells[:, list(f)]
+            at = np.all(np.abs(pts3[fn][:, :, 0] - x_target) < 1e-7, axis=1)
+            if at.any():
+                face_sets.append(fn[at])
+    if not face_sets:
+        raise ValueError(f"no faces found at x = {x_target}")
+    fn = np.vstack(face_sets)                    # (nf, 4) corner nodes
+
+    a, b, c, dd = (pts3[fn[:, i]] for i in range(4))
+    area = 0.5 * np.linalg.norm(np.cross(c - a, dd - b), axis=1)
+    cen = 0.25 * (a + b + c + dd)
+    th_c = np.arctan2(cen[:, 1], cen[:, 2])      # wedge angle at the face
+    rho_c = rho_n[fn].mean(axis=1)
+    u_c = vel_n[fn, 0].mean(axis=1)
+    vy_c = vel_n[fn, 1].mean(axis=1)
+    vz_c = vel_n[fn, 2].mean(axis=1)
+    vt_c = vy_c * np.cos(th_c) - vz_c * np.sin(th_c)
+    spd_c = np.linalg.norm(vel_n[fn], axis=1).mean(axis=1)
+    mach_c = mach_n[fn].mean(axis=1)
+    p_c = p_n[fn].mean(axis=1)
+    p0_c = p0_n[fn].mean(axis=1)
+
+    md_f = rho_c * u_c * area
+    md = float(md_f.sum())
+    if md <= 0.0:
+        raise ValueError("non-positive mass flow at the audit plane")
+
+    def mavg(values):
+        return float((md_f * values).sum() / md)
+
+    return {
+        "mass_flow_kg_s": md,
+        "area_m2": float(area.sum()),
+        "mach": mavg(mach_c),
+        "velocity_m_s": mavg(spd_c),
+        "flow_angle_deg": float(np.degrees(
+            np.arctan2((md_f * vt_c).sum(), (md_f * u_c).sum()))),
+        "static_p_pa": mavg(p_c),
+        "p0_pa": mavg(p0_c),
+        # mean density from continuity: mass flow / integral of axial
+        # velocity over the plane (used by the Zweifel numbers)
+        "density_kg_m3": float(md / ((u_c * area).sum())),
+    }
+
+
+def plot_fields(case_dir, pts, conn, mach, cp, pitch=0.0, positions=None):
     """Mach + Cp contour pictures.
 
-    With a periodic pitch (cascade cases) the contours are drawn three
-    times - main domain plus the upper and lower periodic copies - so the
-    neighbouring blades and the periodicity are visible.
+    Cascade contours include the central passage and its two periodic
+    neighbours. Rotational 3D neighbours are projected after rotation.
     """
-    shifts = (-pitch, 0.0, pitch) if pitch else (0.0,)
+    positions = positions or [np.column_stack((pts[:, 0], pts[:, 1] + dy))
+                              for dy in ((-pitch, 0.0, pitch) if pitch
+                                         else (0.0,))]
     fig, axes = plt.subplots(2, 1, figsize=(9, 5.6))
     for ax, (fld, title, cmap) in zip(
         axes,
         [(mach, "Mach number", "viridis"), (cp, r"pressure coefficient $C_p$", "coolwarm")],
     ):
-        for dy in shifts:
-            tc = ax.tricontourf(pts[:, 0], pts[:, 1] + dy, conn, fld,
+        for xy in positions:
+            tc = ax.tricontourf(xy[:, 0], xy[:, 1], conn, fld,
                                 levels=60, cmap=cmap)
         ax.set_aspect("equal")
         ax.set_xlim(pts[:, 0].min(), pts[:, 0].max())
         ymin, ymax = pts[:, 1].min(), pts[:, 1].max()
-        if pitch:
-            ymin -= 0.45 * pitch
-            ymax += 0.45 * pitch
+        if len(positions) > 1:
+            offset = max(float(np.max(np.abs(xy[:, 1] - pts[:, 1])))
+                         for xy in positions)
+            ymin -= 0.45 * offset
+            ymax += 0.45 * offset
         ax.set_ylim(ymin, ymax)
-        ax.set_title(title + ("  (with periodic copies)" if pitch else ""),
+        ax.set_title(title + ("  (with periodic copies)"
+                              if len(positions) > 1 else ""),
                      fontsize=10)
         ax.set_xlabel("x")
         ax.set_ylabel("y")
@@ -228,7 +343,7 @@ def plot_fields(case_dir, pts, conn, mach, cp, pitch=0.0):
     fig.savefig(case_dir / "fields.png")
     plt.close(fig)
     print(f"fields.png  (max Mach = {mach.max():.3f})"
-          + (f"  [+/- pitch periodic copies]" if pitch else ""))
+          + ("  [periodic copies]" if len(positions) > 1 else ""))
 
 
 # ---------------------------------------------------------------- near wall
@@ -272,8 +387,8 @@ def plot_bl_validation(case_dir, pp, d, pts, vel, fs, R=0.5):
 
     # --- probe-ray BL profile
     probe = pp.get("probe", {"point": [0.0, R], "normal": [0.0, 1.0], "length": 1.2})
-    p0 = np.array(probe["point"])
-    nrm = np.array(probe["normal"], dtype=float)
+    p0 = np.array(probe["point"][:2])   # 3D wedge probes carry a z; the
+    nrm = np.array(probe["normal"][:2], dtype=float)  # slice is already 2D
     nrm /= np.linalg.norm(nrm)
     rel = pts - p0
     t = rel @ nrm
@@ -521,8 +636,8 @@ def plot_wall_cascade(case_dir, pp, d, pts, vel, refs):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10.5, 4.3))
 
     probe = pp.get("probe", {"point": [0.0, 0.0], "normal": [0.0, 1.0], "length": 0.02})
-    p0 = np.array(probe["point"])
-    nrm = np.array(probe["normal"], dtype=float)
+    p0 = np.array(probe["point"][:2])   # 3D wedge probes carry a z; the
+    nrm = np.array(probe["normal"][:2], dtype=float)  # slice is already 2D
     nrm /= np.linalg.norm(nrm)
     rel = pts - p0
     t = rel @ nrm
@@ -532,7 +647,12 @@ def plot_wall_cascade(case_dir, pp, d, pts, vel, refs):
     speed = np.linalg.norm(vel, axis=1)
     tt, vv = t[col], speed[col]
     srt = np.argsort(tt)
-    ax1.plot(tt[srt] * 1e3, vv[srt], "o-", ms=3, lw=1)
+    if len(tt):
+        ax1.plot(tt[srt] * 1e3, vv[srt], "o-", ms=3, lw=1)
+    else:
+        ax1.text(0.5, 0.5, "probe ray found no nodes",
+                 transform=ax1.transAxes, ha="center", fontsize=8,
+                 color="0.4")
     ax1.axhline(refs["V2"], color="k", ls=":", lw=1)
     ax1.annotate(f"isentropic $V_2$ = {refs['V2']:.0f} m/s", xy=(0.98, refs["V2"]),
                  xycoords=("axes fraction", "data"), ha="right", va="bottom", fontsize=8)
@@ -559,8 +679,9 @@ def plot_wall_cascade(case_dir, pp, d, pts, vel, refs):
     fig.tight_layout()
     fig.savefig(case_dir / "bl_validation.png")
     plt.close(fig)
+    first = f"{tt[srt][0]*1e3:.3f} mm" if len(tt) else "n/a"
     print(f"bl_validation.png  (wall nodes: {int(wall.sum())}, "
-          f"first probe node at {tt[srt][0]*1e3:.3f} mm)")
+          f"first probe node at {first})")
 
 
 # ------------------------------------------------------------- results.json
@@ -673,7 +794,7 @@ def write_results(case_dir, case, fs, dist=None):
         forces["LD"] = lift_to_drag(forces["CL"], forces["CD"])
     out["forces"] = forces
 
-    d = load_volume(case_dir)
+    d, d3d = load_volume(case_dir)
     pts, conn, mach, cp, vel = _volume_arrays(d)
     out["fields"] = {"max_mach": float(mach.max())}
 
@@ -693,7 +814,16 @@ def write_results(case_dir, case, fs, dist=None):
         mu_w = 1.716e-5 * (d["Temperature"].ravel()[wall] / 273.15) ** 1.5 \
             * (383.55 / (d["Temperature"].ravel()[wall] + 110.4))
         tau = np.linalg.norm(d["Skin_Friction_Coefficient"][wall, :2], axis=1) * q_ref
-        fl = _first_layer_height(case_dir)
+        # prefer SU2's own Y_Plus field (present on 3D wedge volumes where
+        # the mesh-based first-cell height no longer applies)
+        if "Y_Plus" in d:
+            yp = d["Y_Plus"].ravel()[wall]
+            yp = yp[np.isfinite(yp) & (yp > 0)]
+            if len(yp):
+                out["wall"] = {"yplus_median": float(np.median(yp)),
+                               "yplus_p95": float(np.percentile(yp, 95)),
+                               "wall_nodes": int(wall.sum())}
+        fl = _first_layer_height(case_dir) if "Y_Plus" not in d else None
         if fl:
             yplus = np.sqrt(tau / rho_w) * fl[1] * rho_w / mu_w
             out["wall"] = {"first_layer_height_units": fl,
@@ -702,36 +832,47 @@ def write_results(case_dir, case, fs, dist=None):
                            "wall_nodes": int(wall.sum())}
 
     if cascade:
-        for name, xf in (("inlet", pts[:, 0].min()), ("outlet", pts[:, 0].max())):
-            m = np.isclose(pts[:, 0], xf, atol=1e-7)
-            idx = np.where(m)[0]
-            y = pts[idx, 1]
-            srt = np.argsort(y)
-            y = y[srt]
-            pi, Ti = d["Pressure"].ravel()[idx][srt], d["Temperature"].ravel()[idx][srt]
-            vi, Mi = vel[idx][srt], mach[idx][srt]
-            ri = pi / (R * Ti)
-            u = vi[:, 0]
-            md = np.trapezoid(ri * u, y)
-            p0l = pi * (1 + 0.2 * Mi ** 2) ** 3.5
-            out[name] = {
-                "mass_flow_kg_s_m": float(md),
-                "mach": float(np.trapezoid(ri * u * Mi, y) / md),
-                "velocity_m_s": float(np.trapezoid(ri * u * np.linalg.norm(vi, axis=1), y) / md),
-                "flow_angle_deg": float(np.degrees(np.arctan2(
-                    np.trapezoid(ri * u * vi[:, 1], y), np.trapezoid(ri * u * u, y)))),
-                "static_p_pa": float(np.trapezoid(ri * u * pi, y) / md),
-                "p0_pa": float(np.trapezoid(ri * u * p0l, y) / md),
-                # mean density from continuity: mass flow / integral of
-                # axial velocity over the pitch (used by the Zweifel numbers)
-                "density_kg_m3": float(md / np.trapezoid(u, y)),
-            }
+        if d3d is not None:
+            # 3D wedge: mass-flow-weighted audits over the full-span
+            # inlet/outlet face sets (real kg/s through the sector)
+            for name, xf in (("inlet", d3d["points3d"][:, 0].min()),
+                             ("outlet", d3d["points3d"][:, 0].max())):
+                out[name] = _surface_plane_audit(d3d, float(xf), g, R)
+        else:
+            for name, xf in (("inlet", pts[:, 0].min()), ("outlet", pts[:, 0].max())):
+                m = np.isclose(pts[:, 0], xf, atol=1e-7)
+                idx = np.where(m)[0]
+                y = pts[idx, 1]
+                srt = np.argsort(y)
+                y = y[srt]
+                pi, Ti = d["Pressure"].ravel()[idx][srt], d["Temperature"].ravel()[idx][srt]
+                vi, Mi = vel[idx][srt], mach[idx][srt]
+                ri = pi / (R * Ti)
+                u = vi[:, 0]
+                md = np.trapezoid(ri * u, y)
+                p0l = pi * (1 + 0.2 * Mi ** 2) ** 3.5
+                out[name] = {
+                    "mass_flow_kg_s_m": float(md),
+                    "mach": float(np.trapezoid(ri * u * Mi, y) / md),
+                    "velocity_m_s": float(np.trapezoid(ri * u * np.linalg.norm(vi, axis=1), y) / md),
+                    "flow_angle_deg": float(np.degrees(np.arctan2(
+                        np.trapezoid(ri * u * vi[:, 1], y), np.trapezoid(ri * u * u, y)))),
+                    "static_p_pa": float(np.trapezoid(ri * u * pi, y) / md),
+                    "p0_pa": float(np.trapezoid(ri * u * p0l, y) / md),
+                    # mean density from continuity: mass flow / integral of
+                    # axial velocity over the pitch (used by the Zweifel numbers)
+                    "density_kg_m3": float(md / np.trapezoid(u, y)),
+                }
         p01 = cascade["inlet"]["total_pressure"]
         p2 = cascade["outlet"]["static_pressure"]
         p02 = out["outlet"]["p0_pa"]
         out["losses"] = {"total_pressure_loss_coeff_Yp": float((p01 - p02) / (p01 - p2))}
-        md_i = out["inlet"]["mass_flow_kg_s_m"]
-        md_o = out["outlet"]["mass_flow_kg_s_m"]
+        # 2D cases report per unit depth ("_kg_s_m"); 3D wedge cases real
+        # sector flows ("_kg_s")
+        md_i = out["inlet"].get("mass_flow_kg_s_m",
+                                out["inlet"].get("mass_flow_kg_s"))
+        md_o = out["outlet"].get("mass_flow_kg_s_m",
+                                 out["outlet"].get("mass_flow_kg_s"))
         out["mass_balance"] = {"imbalance_pct": float(abs(md_i - md_o) / md_i * 100)}
         # Zweifel loading coefficients (periodic cascades only). The
         # incompressible form is the classic
@@ -740,11 +881,15 @@ def write_results(case_dir, case, fs, dist=None):
         # compressible form corrects the momentum force by the
         # inlet/outlet density ratio: Zw_c = Zw * (rho1/rho2)
         # (e.g. Ni et al. 2024, "Modified Zweifel Coefficient ...",
-        # Aerospace 11(8):650). s = pitch from the periodic translation,
-        # bx = axial chord (reynolds_length).
+        # Aerospace 11(8):650). s = pitch from the periodic translation
+        # (2D) or the TE pitch of the wedge sector (3D), bx = axial chord
+        # (reynolds_length).
         pers = cascade.get("periodic") or []
         pitch_m = float((pers[0].get("translation") or [0, 0, 0])[1] or 0.0) \
             if pers else 0.0
+        if not pitch_m:                  # rotational (wedge) pair
+            pitch_m = float(cascade.get("pitch_te_m")
+                            or cascade.get("pitch_le_m") or 0.0)
         bx_m = float(case["physics"].get("reynolds_length") or 0.0)
         a1 = out["inlet"]["flow_angle_deg"]
         a2 = out["outlet"]["flow_angle_deg"]
@@ -770,10 +915,13 @@ def write_results(case_dir, case, fs, dist=None):
         # BC-level corrected flow and the outlet one carries the loss.
         T_REF, P_REF = 288.15, 101325.0
         T01 = cascade["inlet"]["total_temperature"]
+        flow_key = "mass_flow_kg_s_m" if "mass_flow_kg_s_m" in out["inlet"] \
+            else "mass_flow_kg_s"
+        corr_key = flow_key.replace("mass_flow", "corrected_flow")
         for name in ("inlet", "outlet"):
             if name in out:
-                out[name]["corrected_flow_kg_s_m"] = float(
-                    out[name]["mass_flow_kg_s_m"] * np.sqrt(T01 / T_REF)
+                out[name][corr_key] = float(
+                    out[name][flow_key] * np.sqrt(T01 / T_REF)
                     / (out[name]["p0_pa"] / P_REF))
 
     # 0D geometry metrics written by the mesh pipeline (axial-chord units)
@@ -805,15 +953,16 @@ def main():
     pp = case.get("postprocess", {})
     freestream = is_freestream_case(case)
 
-    d = load_volume(case_dir)
+    d, _d3d = load_volume(case_dir)
     pts, conn, mach, cp, vel = _volume_arrays(d)
     plot_convergence(case_dir, case_name, case.get("unsteady"))
-    pitch = 0.0
+    pair = None
     if "cascade" in case and not freestream:
         pers = case["cascade"].get("periodic") or []
         if pers:
-            pitch = float((pers[0].get("translation") or [0, 0, 0])[1] or 0.0)
-    plot_fields(case_dir, pts, conn, mach, cp, pitch=pitch)
+            pair = pers[0]
+    plot_fields(case_dir, pts, conn, mach, cp,
+                positions=periodic_plot_positions(d, pair))
     gamma = case["physics"].get("gamma", GAMMA)
     ss_upper = case.get("postprocess", {}).get("ss_upper", True)
     if "cascade" in case and not freestream:

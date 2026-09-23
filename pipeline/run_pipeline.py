@@ -150,6 +150,9 @@ def main():
             f"R1={dom_cfg['R1']} R2={dom_cfg['R2']} -> "
             f"pitch_le={prof['p_le']:.4f}, pitch_te={prof['p_te']:.4f}"
         )
+        if mode == "axisymmetric3d":
+            print(f"      streamtube depth: h1={dom_cfg.get('h1')} "
+                  f"h2={dom_cfg.get('h2')} (same units as R1/R2)")
 
     # 0D geometric metrics (axial-chord units) - copied into the SU2 case
     # by setup_cascade_case.py and merged into results.json by plot_case.py
@@ -225,6 +228,28 @@ def main():
     if stats.get("wake_metal_angle_deg") is not None:
         print(f"      wake band oriented at TE metal angle: "
               f"{stats['wake_metal_angle_deg']:.2f} deg")
+
+    mesh3d_path = None
+    if mode == "axisymmetric3d":
+        from extrude3d import extrude_wedge
+        span_cfg = cfg["mesh"].get("span") or {}
+        n_layers = int(span_cfg.get("layers", 21) or 21)
+        growth = float(span_cfg.get("growth", 1.3) or 1.3)
+        mesh3d_path = str(prefix) + "_quad3d.su2"
+        print(f"      extruding 3D conical wedge: {n_layers} span layers, "
+              f"growth {growth} ...")
+        wstats = extrude_wedge(str(prefix) + "_quad.su2", prof,
+                               mesh3d_path, n_layers=n_layers, growth=growth)
+        print(f"      wedge: {wstats['hexes']} hex + {wstats['prisms']} "
+              f"prism cells, {wstats['points']} points, periodic mismatch "
+              f"{wstats['periodic_max_mismatch']:.2e}")
+        if wstats.get("inverted_cells"):
+            print(f"      WARNING: {wstats['inverted_cells']} twisted "
+                  "cells - the 2D mesh is too coarse for the streamtube "
+                  "curvature; refine (mesh.max_size / periodic_size) if "
+                  "the solve struggles")
+        print(f"      wedge markers: {wstats['markers']}")
+
     print("[4/5] quality report ...")
     report = quality_report(case_dir, prefix)
     print("\n".join("      " + ln for ln in report.splitlines()[2:]))

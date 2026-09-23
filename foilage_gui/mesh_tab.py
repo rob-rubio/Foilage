@@ -25,7 +25,8 @@ from .widgets import FieldWidget, ScrolledFrame  # noqa: E402
 
 MARKER_COLORS = {"airfoil": "#111111", "inlet": "#1f77b4",
                  "outlet": "#d62728", "periodic_bottom": "#2ca02c",
-                 "periodic_top": "#2ca02c", "farfield": "#9467bd"}
+                 "periodic_top": "#2ca02c", "farfield": "#9467bd",
+                 "hub": "#8c564b", "shroud": "#e377c2"}
 
 
 class MeshTab(ttk.Frame):
@@ -55,6 +56,16 @@ class MeshTab(ttk.Frame):
                              lambda _e: self.load_selected())
         ttk.Button(bar, text="Refresh", width=7, command=self.refresh_sources
                    ).pack(side="left", padx=4)
+
+        self.view3d_btn = ttk.Button(bar, text="3D outer view", width=12,
+                                     command=self._open_3d_view)
+        self.view3d_btn.pack(side="left", padx=4)
+        TooltipHelper(self.view3d_btn,
+                      "Open a GPU 3D view (moderngl) of the wedge mesh's "
+                      "outer surface: hub/shroud streamtube walls, periodic "
+                      "faces, blade and inlet/outlet, with translucent "
+                      "shells so the blade is visible. Uses the 3D wedge "
+                      "mesh (mesh_quad3d.su2) or the 3D solver mesh.")
 
         self.marker_vars = {}
         for name in MARKER_COLORS:
@@ -123,12 +134,37 @@ class MeshTab(ttk.Frame):
             widget.set_value(self.app.state.get(path))
 
     # ------------------------------------------------------------ sources
+    def _open_3d_view(self):
+        """Open the moderngl 3D outer-surface view on a 3D mesh."""
+        from tkinter import messagebox
+        from .mesh3d_view import Mesh3DView, is_3d_file
+        state = self.app.state
+        proj = state.mesh_project_dir()
+        candidates = [
+            self._current_path,                                  # selection
+            proj / "mesh_quad3d.su2",                            # wedge mesh
+            state.case_dir() / "mesh.su2",                       # solver mesh
+        ]
+        path = next((p for p in candidates
+                     if p is not None and p.exists() and is_3d_file(p)),
+                    None)
+        if path is None:
+            messagebox.showinfo(
+                "3D view needs a 3D mesh",
+                "No 3D mesh found. Generate one first: the 3D view uses "
+                "the axisymmetric3d wedge mesh (mesh_quad3d.su2) or the "
+                "3D solver mesh.", parent=self)
+            return
+        Mesh3DView.open(self.app, path)
+
     def refresh_sources(self):
         state = self.app.state
         sources = []
         proj = state.mesh_project_dir()
         cases = state.case_dir()
         candidates = [
+            (f"3D wedge mesh - chord units ({proj})",
+             proj / "mesh_quad3d.su2"),
             (f"quad mesh - chord units ({proj})", proj / "mesh_quad.su2"),
             (f"tri mesh - chord units ({proj})", proj / "mesh.su2"),
             (f"solver mesh - scaled [m] ({cases})", cases / "mesh.su2"),
@@ -188,9 +224,16 @@ class MeshTab(ttk.Frame):
         n_pts = len(payload["points"])
         n_quad = 0 if payload["quads"] is None else len(payload["quads"])
         n_tri = 0 if payload["tris"] is None else len(payload["tris"])
-        self.info_var.set(
-            f"{path.name}: {n_pts} nodes, {n_quad} quads + {n_tri} tris  "
-            f"[{', '.join(payload['markers']) or 'no markers'}]")
+        if payload.get("ndim") == 3:
+            self.info_var.set(
+                f"{path.name}: {payload['hexes']} hex + {payload['prisms']} "
+                f"prism ({payload['n_layers']} span layers) - showing the "
+                f"mid-span layer: {n_pts} nodes, {n_quad} quads + {n_tri} "
+                f"tris")
+        else:
+            self.info_var.set(
+                f"{path.name}: {n_pts} nodes, {n_quad} quads + {n_tri} tris  "
+                f"[{', '.join(payload['markers']) or 'no markers'}]")
         self._redraw()
         self._fill_stats()
 
@@ -232,7 +275,8 @@ class MeshTab(ttk.Frame):
         ax.set_ylabel("y")
         name = self._current_path.name if self._current_path else ""
         unit = "m" if "scaled" in self.source_var.get() else "chord units"
-        ax.set_title(f"{name}  ({unit})", fontsize=10)
+        layer = "  (mid-span layer)" if mesh.get("ndim") == 3 else ""
+        ax.set_title(f"{name}  ({unit}){layer}", fontsize=10)
         ax.legend(fontsize=8, loc="upper right")
         self.fig.tight_layout()
         self.canvas.draw_idle()
@@ -243,12 +287,20 @@ class MeshTab(ttk.Frame):
         mesh = self._current
         lines = [f"file: {self._current_path}"]
         pts = mesh["points"]
-        lines.append(f"nodes: {len(pts)}")
+        if mesh.get("ndim") == 3:
+            lines.append(f"cells: {mesh['hexes']} hex + {mesh['prisms']} "
+                         f"prism ({mesh['n_layers']} span layers)")
+            lines.append("view: mid-span node layer")
+        lines.append(f"nodes (shown): {len(pts)}")
         for key, label in (("quads", "quads"), ("tris", "triangles")):
             if mesh[key] is not None:
                 lines.append(f"{label}: {len(mesh[key])}")
-        for name, e in mesh["markers"].items():
-            lines.append(f"marker {name}: {len(e)} edges")
+        if mesh.get("ndim") == 3:
+            for name, cnt in mesh.get("marker_face_counts", {}).items():
+                lines.append(f"marker {name}: {cnt} faces")
+        else:
+            for name, e in mesh["markers"].items():
+                lines.append(f"marker {name}: {len(e)} edges")
         bbox = (f"x [{pts[:, 0].min():.4g}, {pts[:, 0].max():.4g}]  "
                 f"y [{pts[:, 1].min():.4g}, {pts[:, 1].max():.4g}]")
         lines.append(f"extent: {bbox}")

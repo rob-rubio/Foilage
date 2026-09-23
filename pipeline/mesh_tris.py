@@ -3,16 +3,24 @@ all-triangle mesh.
 
 ``domain.periodicity`` selects the domain (see pipeline/unwrap.py):
 
-    axisymmetric  - unwrapped annular cascade sector: pitch varies with
-                    the annulus radius, p(x) = 2 pi R(x) / N (R linearly
-                    interpolated R1 -> R2 over the blade, constant
-                    fore/aft). Top/bottom are a translation-periodic pair.
-    offset        - linear cascade: constant pitch p = 2 pi R1 / N and
-                    straight periodic lines through y = 0 -/+ p/2 (no
-                    tangential offset); y is Cartesian.
-    freestream    - no periodics: the upper/lower boundaries are
-                    far-field lines at domain.y_min / domain.y_max
-                    (isolated airfoil calculations).
+    axisymmetric   - unwrapped annular cascade sector: pitch varies with
+                     the annulus radius, p(x) = 2 pi R(x) / N (R linearly
+                     interpolated R1 -> R2 over the blade, constant
+                     fore/aft). Top/bottom are a translation-periodic pair.
+    axisymmetric3d - the same unwrapped sector extruded into a true
+                     conical wedge (pipeline/extrude3d.py): the 2D mesh
+                     is wrapped to polar coordinates and stacked spanwise
+                     between the streamtube walls r = R(x) -/+ h(x)/2,
+                     with h(x) the logistic streamtube depth (domain.h1
+                     -> domain.h2 over the blade, clamped fore/aft). R(x)
+                     continues linearly beyond the LE and TE. The
+                     periodic pair is rotational, so R1 != R2 is legal.
+    offset         - linear cascade: constant pitch p = 2 pi R1 / N and
+                     straight periodic lines through y = 0 -/+ p/2 (no
+                     tangential offset); y is Cartesian.
+    freestream     - no periodics: the upper/lower boundaries are
+                     far-field lines at domain.y_min / domain.y_max
+                     (isolated airfoil calculations).
 
 The blade sits in the middle of the passage; in the periodic modes the
 two domain edges are the passage medial axes  y = y_c(x) -/+ p(x)/2
@@ -30,9 +38,9 @@ Physical groups: inlet, outlet, periodic_bottom + periodic_top
 import numpy as np
 
 try:
-    from unwrap import periodicity_of
+    from unwrap import periodicity_of, UNWRAPPED_MODES
 except ImportError:                                  # package-style import
-    from pipeline.unwrap import periodicity_of
+    from pipeline.unwrap import periodicity_of, UNWRAPPED_MODES
 
 TYPE_NAMES = {1: "line", 2: "triangle", 3: "quad"}
 NSEG_PERIODIC = 60  # transfinite segments per periodic edge
@@ -45,7 +53,13 @@ def pitch_profile(dom_cfg, airfoil):
     ``domain.R1`` / ``domain.R2`` are the annulus radii at the LE/TE in
     *actual units* (the same units as ``airfoil.axial_chord``, e.g. mm).
     They are normalized by the axial chord here so the passage is built
-    in normalized coordinates (blade axial chord = 1). In offset mode
+    in normalized coordinates (blade axial chord = 1). ``domain.h1`` /
+    ``domain.h2`` are the streamtube depths at the LE/TE in the same
+    units; h(x) transitions between them with a logistic (steepness
+    ``domain.h_steepness``, default 10) over the blade and is clamped to
+    h1 fore of the LE / h2 aft of the TE. In axisymmetric3d mode, R(x)
+    extrapolates the LE-to-TE linear transition beyond both edges; other
+    modes keep R constant outside the blade. In offset mode
     R2 is ignored (constant pitch through R1) and the centerline is
     straight; in freestream mode the pitch values are unused and the
     domain extends to domain.y_min / domain.y_max instead."""
@@ -54,9 +68,19 @@ def pitch_profile(dom_cfg, airfoil):
     ac = float(airfoil.get("axial_chord") or 0.0)
     r1 = float(dom_cfg["R1"])
     r2 = float(dom_cfg.get("R2", dom_cfg["R1"]))
+    h1 = dom_cfg.get("h1")
+    h2 = dom_cfg.get("h2")
+    if h1 is None:
+        h1 = h2 if h2 is not None else 2.0 * np.pi * r1 / N
+    if h2 is None:
+        h2 = h1
+    h1, h2 = float(h1), float(h2)
+    h_s = float(dom_cfg.get("h_steepness") or 10.0)
     if ac > 0:                       # actual units -> normalized
         r1 /= ac
         r2 /= ac
+        h1 /= ac
+        h2 /= ac
     if mode == "offset":
         r2 = r1                      # no tangential offset: constant pitch
 
@@ -84,7 +108,7 @@ def pitch_profile(dom_cfg, airfoil):
         kernel = np.ones(5) / 5.0
         y_mid = np.convolve(np.pad(y_mid, 2, mode="edge"), kernel,
                             mode="valid")
-    if mode != "axisymmetric":
+    if mode not in UNWRAPPED_MODES:
         # offset / freestream: no tangential offset, y is Cartesian and
         # the domain is centered on the blade row (y_c identically 0)
         y_mid = np.zeros_like(y_mid)
@@ -108,15 +132,26 @@ def pitch_profile(dom_cfg, airfoil):
 
     def radius(x):
         t = (np.asarray(x, dtype=float) - x_le) / max(x_te - x_le, 1e-30)
-        t = np.clip(t, 0.0, 1.0)
+        if mode != "axisymmetric3d":
+            t = np.clip(t, 0.0, 1.0)
         return r1 + (r2 - r1) * t
+
+    def h(x):
+        """Streamtube depth: logistic h1 -> h2 over the blade, clamped to
+        h1 fore of the LE and h2 aft of the TE (normalized units)."""
+        t = (np.asarray(x, dtype=float) - x_le) / max(x_te - x_le, 1e-30)
+        z = np.clip(h_s * (t - 0.5), -50.0, 50.0)
+        sig = 1.0 / (1.0 + np.exp(-z))
+        mid = h1 + (h2 - h1) * sig
+        return np.where(t <= 0.0, h1, np.where(t >= 1.0, h2, mid))
 
     def p(x):
         return 2.0 * np.pi * radius(x) / N
 
-    prof = {"p": p, "radius": radius, "y_c": y_c,
+    prof = {"p": p, "radius": radius, "h": h, "y_c": y_c,
             "e": lambda x: p(x) / 2.0,
             "p_le": p_le, "p_te": p_te, "x_le": x_le, "x_te": x_te,
+            "h1": h1, "h2": h2, "h_steepness": h_s,
             "mode": mode, "periodic": mode != "freestream"}
     if mode == "freestream":
         prof["y_min"] = float(dom_cfg.get("y_min", -1.5))

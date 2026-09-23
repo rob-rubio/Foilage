@@ -324,6 +324,12 @@ class OptimizationTab(ttk.Frame):
         return (self.app.state.get("domain.periodicity") or "axisymmetric") \
             == "freestream"
 
+    def _is_wedge_case(self):
+        if self._loaded_state:
+            return (self._loaded_state.get("base_config") or {}).get(
+                "domain", {}).get("periodicity") == "axisymmetric3d"
+        return self.app.state.get("domain.periodicity") == "axisymmetric3d"
+
     def _build_output_quantity_panels(self):
         """Build mode-specific objective and constraint rows.
 
@@ -352,7 +358,8 @@ class OptimizationTab(ttk.Frame):
         tk.Label(hdr, text="maximize", font=("TkDefaultFont", 8)).pack(
             side="left", padx=(8, 0))
         self.obj_vars = {}
-        for obj in objectives_for_case(self._is_freestream_case()):
+        for obj in objectives_for_case(self._is_freestream_case(),
+                                       wedge=self._is_wedge_case()):
             row = ttk.Frame(self.obj_box)
             row.pack(fill="x", padx=4)
             check = tk.BooleanVar(value=old_obj.get(obj["path"],
@@ -394,7 +401,8 @@ class OptimizationTab(ttk.Frame):
         tk.Label(hdr, text="max (<=)", font=("TkDefaultFont", 8)).pack(
             side="left", padx=(12, 0))
         self.con_vars = {}
-        for con in constraint_quantities_for_case(self._is_freestream_case()):
+        for con in constraint_quantities_for_case(self._is_freestream_case(),
+                                                  wedge=self._is_wedge_case()):
             row = ttk.Frame(self.con_box)
             row.pack(fill="x", padx=4)
             previous = old_con.get(con["path"], (False, "", ""))
@@ -490,7 +498,10 @@ class OptimizationTab(ttk.Frame):
         except (TypeError, ValueError):
             morph_n = 0
         return design_variables_for(src, morph_n=morph_n if morph_n >= 2
-                                    else 0)
+                                    else 0,
+                                    wedge=(self.app.state.get(
+                                        "domain.periodicity")
+                                        == "axisymmetric3d"))
 
     @staticmethod
     def _catalog_sig(catalog):

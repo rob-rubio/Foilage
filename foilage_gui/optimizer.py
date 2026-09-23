@@ -122,28 +122,55 @@ ZWEIFEL_GEOMETRIC_CONSTRAINT = [
 FREESTREAM_CONSTRAINT_QUANTITIES = FREESTREAM_OBJECTIVES
 
 
-def objectives_for_case(freestream=False):
+# Real wedge-sector flow objectives: swapped in for the per-unit-depth
+# entries when the case runs in 3D wedge mode (results.json then reports
+# actual kg/s through the sector, not kg/(s.m)).
+WEDGE_FLOW_OBJECTIVES = [
+    {"path": "outlet.mass_flow_kg_s",
+     "label": "Outlet mass flow [kg/s (wedge)]", "sense": "max"},
+    {"path": "inlet.corrected_flow_kg_s",
+     "label": "Corrected flow, inlet [kg/s (wedge)]", "sense": "max"},
+    {"path": "outlet.corrected_flow_kg_s",
+     "label": "Corrected flow, outlet [kg/s (wedge)]", "sense": "max"},
+]
+
+_PER_DEPTH_TO_WEDGE = {
+    "outlet.mass_flow_kg_s_m": WEDGE_FLOW_OBJECTIVES[0],
+    "inlet.corrected_flow_kg_s_m": WEDGE_FLOW_OBJECTIVES[1],
+    "outlet.corrected_flow_kg_s_m": WEDGE_FLOW_OBJECTIVES[2],
+}
+
+
+def objectives_for_case(freestream=False, wedge=False):
     """Return the output-objective catalog for the selected flow mode.
 
     The Zweifel loading coefficients are offered for periodic cascades
     only - freestream runs have no pitch, so no Zweifel is written to
-    results.json."""
+    results.json. ``wedge`` swaps the per-unit-depth flow objectives for
+    the real wedge-sector ones."""
+    base = ([_PER_DEPTH_TO_WEDGE.get(o["path"], o) for o in OBJECTIVES]
+            if wedge else list(OBJECTIVES))
     extra = []
     if not freestream:
         extra += ZWEIFEL_QUANTITIES
-    return list(OBJECTIVES) + extra + (list(FREESTREAM_OBJECTIVES)
-                                       if freestream else [])
+    return base + extra + (list(FREESTREAM_OBJECTIVES)
+                           if freestream else [])
 
 
-def constraint_quantities_for_case(freestream=False):
+def constraint_quantities_for_case(freestream=False, wedge=False):
     """Return the output-constraint catalog for the selected flow mode.
 
     Periodic cascades can additionally band the Zweifel loading - the
-    CFD values or the geometric predictor from the mesh pipeline."""
+    CFD values or the geometric predictor from the mesh pipeline.
+    ``wedge`` swaps the per-unit-depth flow quantities for the real
+    wedge-sector ones."""
+    base = CONSTRAINT_QUANTITIES
+    if wedge:
+        base = [_PER_DEPTH_TO_WEDGE.get(o["path"], o) for o in base]
     extra = []
     if not freestream:
         extra += ZWEIFEL_QUANTITIES + ZWEIFEL_GEOMETRIC_CONSTRAINT
-    return list(CONSTRAINT_QUANTITIES) + extra + (
+    return list(base) + extra + (
         list(FREESTREAM_CONSTRAINT_QUANTITIES) if freestream else [])
 
 # pyturbo generator parameters offered as design variables; suggested
@@ -168,6 +195,11 @@ DESIGN_VARS = [{"path": f.path,
 # generator - offered for every airfoil source
 _DOMAIN_DV_PATHS = ("domain.R1", "domain.airfoil_count")
 
+# extra design variables for the 3D wedge mode: the TE radius is free
+# (rotational periodics support R1 != R2) and the streamtube contraction
+# becomes optimizable
+_WEDGE_DV_PATHS = ("domain.R2", "domain.h1", "domain.h2")
+
 CAGE_DV_DEFAULT_BOUND = 0.1     # +/- offset bound prefilled for cage DVs
 
 
@@ -187,15 +219,26 @@ def ffd_design_vars(n, bound=CAGE_DV_DEFAULT_BOUND):
     return dvs
 
 
-def design_variables_for(source_type, morph_n=0, extensions_dir=None):
+def _field_dvs(paths):
+    return [{"path": p, "label": FIELDS_BY_PATH[p].label,
+             "kind": "int" if FIELDS_BY_PATH[p].kind == "int" else "float",
+             "min": FIELDS_BY_PATH[p].min, "max": FIELDS_BY_PATH[p].max}
+            for p in paths]
+
+
+def design_variables_for(source_type, morph_n=0, extensions_dir=None,
+                         wedge=False):
     """Design-variable catalog for the active airfoil source.
 
     pyturbo: the generator parameters (DESIGN_VARS). A geomTurbo import
     or an extension plugin additionally gets the plugin's declared
     parameters (with the manifest's min/max), the domain variables, and
-    the FFD morph-cage offsets when a morph lattice is defined."""
+    the FFD morph-cage offsets when a morph lattice is defined. The 3D
+    wedge mode (``wedge``) exposes R2 and the streamtube depths h1/h2 on
+    top - its rotational periodics support R1 != R2."""
+    wedge_dvs = _field_dvs(_WEDGE_DV_PATHS) if wedge else []
     if source_type == "pyturbo":
-        return [dict(d) for d in DESIGN_VARS]
+        return [dict(d) for d in DESIGN_VARS] + wedge_dvs
     dvs = []
     if source_type != "geomturbo":
         try:
@@ -223,6 +266,7 @@ def design_variables_for(source_type, morph_n=0, extensions_dir=None):
         dvs.append({"path": path, "label": f.label,
                     "kind": "int" if f.kind == "int" else "float",
                     "min": f.min, "max": f.max})
+    dvs += wedge_dvs
     if morph_n and morph_n >= 2:
         dvs += ffd_design_vars(int(morph_n))
     return dvs
@@ -1087,7 +1131,9 @@ class OptimizationRun:
                and "@" in d["path"] for d in self.design_vars):
             set_path(cfg, "airfoil_source.morph.enabled", True)
         # pitch exploration must keep the SU2 single-translation pair valid
-        if get_path(cfg, "domain.R1") is not None:
+        # (the 3D wedge's rotational pair instead supports R1 != R2)
+        if get_path(cfg, "domain.R1") is not None and \
+                get_path(cfg, "domain.periodicity") != "axisymmetric3d":
             set_path(cfg, "domain.R2", get_path(cfg, "domain.R1"))
         # local solver override: applies to this evaluation only
         if self.max_iterations:

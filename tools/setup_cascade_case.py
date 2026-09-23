@@ -45,6 +45,12 @@ from freestream import gamma_of_air, sutherland_mu  # noqa: E402
 SUPPORTED_TURBULENCE_MODELS = {"SA", "SST"}
 DEFAULT_TURBULENCE_MODEL = "SA"
 DEFAULT_MAX_ITERATIONS = 6000
+CONV_FIELD_PRESETS = {
+    # residuals SU2 must drive below the convergence floor (ALL of them)
+    "density_energy": ["RMS_DENSITY", "RMS_ENERGY"],
+    "density": ["RMS_DENSITY"],
+}
+DEFAULT_CONV_CRITERION = "density_energy"
 DEFAULT_NUMERICS = {
     "limiter": "VENKATAKRISHNAN",
     "gradient": "WEIGHTED_LEAST_SQUARES",
@@ -52,6 +58,60 @@ DEFAULT_NUMERICS = {
     "cfl_adapt": [0.1, 1.2, 5.0, 40.0],
     "linear_solver_iter": 100,
 }
+
+
+def load_conv_fields(cfg):
+    """Convergence fields from input.json (solver_settings.convergence_criterion).
+
+    'density_energy' (default) requires BOTH the density and energy
+    residuals to fall below the floor: stopping on density alone can
+    declare a false 'converged' while the energy equation is still
+    unconverged (seen on 3D wedge cases that choke and pressurize)."""
+    crit = (cfg.get("solver_settings") or {}).get("convergence_criterion") \
+        or DEFAULT_CONV_CRITERION
+    fields = CONV_FIELD_PRESETS.get(str(crit).strip().lower())
+    if fields is None:
+        sys.exit(f"solver_settings.convergence_criterion = {crit!r} is not "
+                 f"one of: {', '.join(CONV_FIELD_PRESETS)}")
+    return list(fields)
+
+
+def streamtube_exit_check(p01, p2, area_ratio, gamma):
+    """Quasi-1D feasibility of the (Pt_in, p_out) pair on a streamtube
+    whose exit area is `area_ratio` x its inlet area.
+
+    The mass flow the exit demands at p_out with the isentropic exit Mach
+    is A2*Pt_in*C*phi(M2_is); the inlet can swallow at most the choking
+    flow A1*Pt_in*C*phi(1). If demanded > capacity, no steady solution
+    exists for the prescribed pair (the passage diffuses/pressurizes
+    instead). Returns a dict of the diagnostic numbers."""
+    g = float(gamma)
+
+    def phi(m):
+        return m * (1.0 + 0.5 * (g - 1.0) * m * m) \
+            ** (-(g + 1.0) / (2.0 * (g - 1.0)))
+
+    ratio = p01 / p2 if p2 > 0 else float("inf")
+    m2_is = math.sqrt(max(2.0 / (g - 1.0) * (ratio ** ((g - 1.0) / g) - 1.0),
+                          0.0))
+    phi_max = phi(1.0)
+    phi_req = area_ratio * phi(m2_is)
+    # minimum feasible p_out: solve phi(m2*) = phi_max / area_ratio
+    target = phi_max / area_ratio
+    lo, hi = 0.0, 1.0
+    for _ in range(60):                  # phi rises monotonically on (0, 1)
+        mid = 0.5 * (lo + hi)
+        if phi(mid) < target:
+            lo = mid
+        else:
+            hi = mid
+    m2_star = 0.5 * (lo + hi)
+    p2_min = p01 * (1.0 + 0.5 * (g - 1.0) * m2_star * m2_star) \
+        ** (-g / (g - 1.0))
+    return {"area_ratio": area_ratio, "m2_is": m2_is,
+            "phi_req": phi_req, "phi_max": phi_max,
+            "over_capacity": phi_req / phi_max,
+            "p2_min": p2_min, "feasible": p2 >= p2_min}
 
 
 def cascade_flow_states(p01, T01, p2, gamma, R=287.058):
@@ -218,14 +278,20 @@ def parse_airfoil_mesh(path):
     with open(path) as f:
         lines = f.read().splitlines()
     i, pts, af = 0, None, None
+    ndim = 2
     while i < len(lines):
         ln = lines[i].strip()
+        if ln.startswith("NDIME="):
+            ndim = int(float(ln.split("=")[1].split()[0]))
+            i += 1
+            continue
         if ln.startswith("NPOIN="):
             n = int(ln.split("=")[1].split()[0])
-            pts = np.zeros((n, 2))
+            pts = np.zeros((n, ndim))
             for j in range(n):
                 p = lines[i + 1 + j].split()
-                pts[j, 0], pts[j, 1] = float(p[0]), float(p[1])
+                for k in range(ndim):
+                    pts[j, k] = float(p[k])
             i += n + 1
             continue
         if ln.startswith("MARKER_TAG= airfoil"):
@@ -233,8 +299,30 @@ def parse_airfoil_mesh(path):
             nodes = set()
             for j in range(cnt):
                 p = [int(x) for x in lines[i + 2 + j].split()]
-                nodes.update(p[1:-1] if len(p) > 3 else p[1:3])
-            af = np.array(sorted(nodes))
+                nodes.update(p[1:3] if len(p) == 3 else p[1:5])
+            if ndim == 3:
+                # 3D (wedge) mesh: collapse the airfoil surface to its
+                # mid-span node layer. The span direction is radial, so
+                # nodes are grouped into spanwise stacks by (x, theta)
+                # and the mid-ranked member of each stack is kept.
+                idx = sorted(nodes)
+                xs3 = np.round(pts[idx, 0], 9)
+                th3 = np.round(np.arctan2(pts[idx, 1], pts[idx, 2]), 9)
+                r3 = np.hypot(pts[idx, 1], pts[idx, 2])
+                stacks = {}
+                for k, n_id in enumerate(idx):
+                    stacks.setdefault((xs3[k], th3[k]), []).append(k)
+                n_layers = max(len(v) for v in stacks.values()) \
+                    if stacks else 0
+                mid = max(0, (n_layers - 1) // 2)
+                keep = set()
+                for members in stacks.values():
+                    if len(members) != n_layers:
+                        continue
+                    mem = np.asarray(members, dtype=np.int64)
+                    keep.add(idx[int(mem[np.argsort(r3[mem])][mid])])
+                nodes = keep
+            af = np.array(sorted(nodes), dtype=int)
             break
         i += 1
     return pts, af
@@ -243,17 +331,22 @@ def parse_airfoil_mesh(path):
 def scale_mesh(path, scale):
     with open(path) as f:
         lines = f.read().splitlines()
+    ndim = 2
     out, i = [], 0
     while i < len(lines):
         ln = lines[i]
+        if ln.startswith("NDIME="):
+            ndim = int(float(ln.split("=")[1].split()[0]))
+            out.append(ln)
+            i += 1
+            continue
         if ln.startswith("NPOIN="):
             n = int(ln.split("=")[1].split()[0])
             out.append(ln)
             for j in range(n):
                 parts = lines[i + 1 + j].split()
-                x, y = float(parts[0]) * scale, float(parts[1]) * scale
-                idx = parts[2] if len(parts) > 2 else ""
-                out.append(f"\t{repr(x)}\t{repr(y)}\t{idx}".rstrip())
+                coords = [repr(float(v) * scale) for v in parts[:ndim]]
+                out.append("\t" + "\t".join(coords + parts[ndim:]))
             i += n + 1
             continue
         out.append(ln)
@@ -315,10 +408,21 @@ def main():
     su2_dir = REPO / "cases" / su2_name
     su2_dir.mkdir(parents=True, exist_ok=True)
 
+    # ---- domain / periodicity (read before mesh selection: the 3D wedge
+    # mode uses a different mesh file)
+    dom = cfg["domain"]
+    mode = dom.get("periodicity", "axisymmetric")
+    wedge3d = mode == "axisymmetric3d"
+    periodic = mode in ("axisymmetric", "axisymmetric3d", "offset")
+
     # ---- mesh (regenerate on request or if missing)
-    mesh_src = case_root / "cases" / mesh_name / "mesh_quad.su2"
-    if not mesh_src.exists():
-        mesh_src = case_root / "cases" / mesh_name / "mesh.su2"
+    mesh_dir = case_root / "cases" / mesh_name
+    if wedge3d:
+        mesh_src = mesh_dir / "mesh_quad3d.su2"
+    else:
+        mesh_src = mesh_dir / "mesh_quad.su2"
+        if not mesh_src.exists():
+            mesh_src = mesh_dir / "mesh.su2"
     if args.remesh or not mesh_src.exists():
         proj = case_root.parent.parent
         py = Path(sys.executable)
@@ -327,31 +431,59 @@ def main():
                         str(case_root / "input.json")], check=True,
                        creationflags=CREATE_NO_WINDOW)
     if not mesh_src.exists():
-        sys.exit(f"mesh not found at {mesh_src} (run with --remesh)")
+        wanted = ("mesh_quad3d.su2 (axisymmetric3d mode)" if wedge3d
+                  else "mesh_quad.su2")
+        sys.exit(f"mesh not found at {mesh_src} (run with --remesh; "
+                 f"expected {wanted})")
 
     # ---- geometry scale
     ac = float(cfg["airfoil"]["axial_chord"])
     scale = args.scale if args.scale is not None else (ac / 1000.0 if ac >= 1.0 else ac)
     print(f"[scale] axial_chord = {ac} -> {scale} m per chord unit")
 
-    # ---- domain / periodic translation
-    dom = cfg["domain"]
-    mode = dom.get("periodicity", "axisymmetric")
-    periodic = mode in ("axisymmetric", "offset")
     if periodic and mode == "axisymmetric" and \
             abs(dom["R1"] - dom["R2"]) > 1e-9 * max(dom["R1"], dom["R2"], 1.0):
         sys.exit("R1 != R2 (varying pitch) cannot be paired by SU2 - "
                  "regenerate the mesh with R1 = R2 (see the_process.md)")
     # R1/R2 are actual radii (same units as axial_chord): convert to meters
     units_to_m = 0.001 if ac >= 1.0 else 1.0
-    pitch_m = 2.0 * math.pi * dom["R1"] * units_to_m / dom["airfoil_count"] \
+    pitch_le_m = 2.0 * math.pi * dom["R1"] * units_to_m / dom["airfoil_count"] \
         if periodic else 0.0
+    pitch_te_m = 2.0 * math.pi * dom["R2"] * units_to_m / dom["airfoil_count"] \
+        if periodic else 0.0
+    pitch_m = pitch_le_m
 
     # ---- BCs from input.json
     p01, T01, ang, p2 = load_bc(cfg)
     rad = math.radians(ang)
     direction = [math.cos(rad), math.sin(rad), 0.0]
     print(f"[bcs] inlet: p0={p01} Pa, T0={T01} K, angle={ang} deg | outlet: p={p2} Pa")
+
+    # ---- quasi-1D feasibility of the BC pair on the streamtube: an
+    # expanding wedge (R2*h2 > R1*h1) with p_out too low has NO steady
+    # solution - the domain pressurizes to Pt_in and the through-flow
+    # collapses instead
+    if wedge3d:
+        h1 = float(dom.get("h1") or 0.0)
+        h2 = float(dom.get("h2") or h1)
+        if h1 > 0.0 and h2 > 0.0:
+            area_ratio = (float(dom["R2"]) * h2) / (float(dom["R1"]) * h1)
+            chk = streamtube_exit_check(p01, p2, area_ratio, gamma)
+            print(f"[bcs] streamtube A2/A1 = {area_ratio:.3f} | isentropic "
+                  f"exit M = {chk['m2_is']:.3f} | minimum feasible p_out "
+                  f"~ {chk['p2_min']:,.0f} Pa")
+            if not chk["feasible"]:
+                print(f"[bcs] WARNING: prescribed p_out = {p2:,.0f} Pa is "
+                      f"{p2 / chk['p2_min']:.2f}x below the feasible floor "
+                      f"for this expanding streamtube (inlet choking "
+                      f"over capacity {chk['over_capacity']:.2f}x). No "
+                      "steady solution exists: the passage will "
+                      "pressurize toward Pt_in, the through-flow will "
+                      "collapse and the exit flow will reverse. Raise "
+                      "p_out or contract the streamtube (R2*h2).")
+            elif chk["over_capacity"] > 0.9:
+                print("[bcs] WARNING: p_out is close to the choking limit "
+                      "of this streamtube")
 
     # ---- copy + scale mesh
     (su2_dir / "mesh.su2").write_bytes(mesh_src.read_bytes())
@@ -368,6 +500,11 @@ def main():
     # ---- postprocess hints measured on this airfoil
     pts, af = parse_airfoil_mesh(su2_dir / "mesh.su2")
     p0, nrm, zoom = measure_surface_probe(pts, af)
+    probe_point = [round(float(p0[0]), 9), round(float(p0[1]), 9)]
+    probe_normal = [round(float(nrm[0]), 4), round(float(nrm[1]), 4)]
+    if len(p0) > 2:                  # 3D wedge mesh: keep the mid-span z
+        probe_point.append(round(float(p0[2]), 9))
+        probe_normal.append(0.0)
 
     # ---- reference / init state
     R = 287.058
@@ -383,6 +520,8 @@ def main():
 
     mode_desc = {
         "axisymmetric": "Turbine vane cascade auto-setup",
+        "axisymmetric3d": ("Conical wedge cascade (3D streamtube, "
+                           "slip hub/shroud) auto-setup"),
         "offset": "Linear-cascade (offset periodics) auto-setup",
         "freestream": "Isolated-airfoil (freestream boundaries) auto-setup",
     }.get(mode, "Turbine vane cascade auto-setup")
@@ -423,12 +562,12 @@ def main():
             "outlet": {"bc": "outlet", "analyze": True},
         },
         "numerics": numerics,
-        "convergence": {"fields": ["RMS_DENSITY"], "minval": -6.0,
+        "convergence": {"fields": load_conv_fields(cfg), "minval": -6.0,
                         "startiter": 100, "iterations": max_iterations},
         "postprocess": {
-            "wall_hint": [round(float(p0[0]), 9), round(float(p0[1]), 9)],
-            "probe": {"point": [round(float(p0[0]), 9), round(float(p0[1]), 9)],
-                      "normal": [round(float(nrm[0]), 4), round(float(nrm[1]), 4)],
+            "wall_hint": probe_point[:2],
+            "probe": {"point": probe_point,
+                      "normal": probe_normal,
                       "length": round(0.5 * scale, 6)},
             "zoom": {k: round(v, 6) for k, v in zoom.items()},
             # suction side is the upper surface for clockwise turning (CAP),
@@ -437,11 +576,35 @@ def main():
                         < float(cfg["airfoil"]["alpha1"]),
         },
     }
+    if wedge3d:
+        # Slip hub/shroud streamtube walls + planform reference area so
+        # the 3D CD/CL stay comparable with the 2D per-unit-depth values
+        case["markers"]["hub"] = {"bc": "slip"}
+        case["markers"]["shroud"] = {"bc": "slip"}
+        h1 = float(dom.get("h1") or 0.0)
+        h2 = float(dom.get("h2") or h1)
+        case["physics"]["ref_area"] = scale * (0.5 * (h1 + h2) * units_to_m)
+        case["cascade"]["pitch_le_m"] = pitch_le_m
+        case["cascade"]["pitch_te_m"] = pitch_te_m
     if periodic:
-        # translational periodic pair (R1 = R2 -> constant pitch in meters)
-        case["cascade"]["periodic"] = [
-            {"markers": ["periodic_bottom", "periodic_top"],
-             "translation": [0.0, pitch_m, 0.0]}]
+        if wedge3d:
+            # rotational periodic pair: the constant wedge angle 2 pi / N
+            # about the machine axis (x) maps one face onto the other, so a
+            # varying radius R1 -> R2 is legal. The extrusion puts
+            # periodic_top at theta = theta_bottom + 2 pi / N, and SU2
+            # rotates the DONOR (second marker) onto the first, so the
+            # working angle is the negative wedge angle (validation still
+            # settles the sign empirically - see below).
+            case["cascade"]["periodic"] = [
+                {"markers": ["periodic_bottom", "periodic_top"],
+                 "center": [0.0, 0.0, 0.0], "axis": [1.0, 0.0, 0.0],
+                 "rotation_deg": -360.0 / float(dom["airfoil_count"]),
+                 "translation": [0.0, 0.0, 0.0]}]
+        else:
+            # translational periodic pair (R1 = R2 -> constant pitch in meters)
+            case["cascade"]["periodic"] = [
+                {"markers": ["periodic_bottom", "periodic_top"],
+                 "translation": [0.0, pitch_m, 0.0]}]
     else:
         # Freestream mode: all four outer edges are farfield.  Keep the
         # separate mesh tags so existing meshes remain usable, but do not
@@ -454,11 +617,14 @@ def main():
     print(f"[case] wrote {su2_dir / 'case.json'}")
 
     # ---- render config
-    subprocess.run([sys.executable, str(REPO / "tools" / "render_config.py"),
-                    str(su2_dir / "case.json"),
-                    str(REPO / "templates" / "su2_cascade.cfg"),
-                    str(su2_dir / "turbine.cfg")], check=True,
-                   creationflags=CREATE_NO_WINDOW)
+    def render_cfg():
+        subprocess.run([sys.executable, str(REPO / "tools" / "render_config.py"),
+                        str(su2_dir / "case.json"),
+                        str(REPO / "templates" / "su2_cascade.cfg"),
+                        str(su2_dir / "turbine.cfg")], check=True,
+                       creationflags=CREATE_NO_WINDOW)
+
+    render_cfg()
 
     # ---- validate periodic pairing + BCs (2 iterations)
     bdir = None
@@ -475,19 +641,39 @@ def main():
             for f in prev:
                 (su2_dir / f).replace(bdir / f)
             print(f"[validate] previous results moved to {bdir.name}")
-        text = (su2_dir / "turbine.cfg").read_text()
-        text = re.sub(r"(?m)^ITER=[ \t]+\d+[ \t]*$", "ITER= 2", text)
-        text = re.sub(r"(?m)^CONV_STARTITER=[ \t]+\d+[ \t]*$",
-                      "CONV_STARTITER= 2", text)
-        (su2_dir / "validate.cfg").write_text(text)
-        r = subprocess.run([str(su2_exe),
-                            "-t", "6", "validate.cfg"],
-                           cwd=str(su2_dir), capture_output=True, text=True,
-                           timeout=300, creationflags=CREATE_NO_WINDOW)
-        log = r.stdout + r.stderr
-        # freestream cases have no periodic pair, so there is no
-        # "Matched" pairing line to look for
-        if r.returncode != 0 or (periodic and "Matched" not in log):
+        # the rotational pair's sign matters for the halo construction: a
+        # wrong sign still reports "Matched" (SU2 checks both directions)
+        # but builds halos from wrong neighbours and diverges - so accept a
+        # candidate ONLY when the pairing log is clean of bad-match lines
+        for sign in ([-1.0, 1.0] if wedge3d else [1.0]):
+            if wedge3d:
+                case["cascade"]["periodic"][0]["rotation_deg"] = \
+                    sign * 360.0 / float(dom["airfoil_count"])
+                (su2_dir / "case.json").write_text(
+                    json.dumps(case, indent=2))
+                render_cfg()
+            text = (su2_dir / "turbine.cfg").read_text()
+            text = re.sub(r"(?m)^ITER=[ \t]+\d+[ \t]*$", "ITER= 2", text)
+            text = re.sub(r"(?m)^CONV_STARTITER=[ \t]+\d+[ \t]*$",
+                          "CONV_STARTITER= 2", text)
+            (su2_dir / "validate.cfg").write_text(text)
+            r = subprocess.run([str(su2_exe),
+                                "-t", "6", "validate.cfg"],
+                               cwd=str(su2_dir), capture_output=True,
+                               text=True, timeout=300,
+                               creationflags=CREATE_NO_WINDOW)
+            log = r.stdout + r.stderr
+            # freestream cases have no periodic pair, so there is no
+            # "Matched" pairing line to look for
+            ok = r.returncode == 0 and (not periodic or "Matched" in log)
+            if wedge3d:
+                ok = ok and "Bad match" not in log
+            if ok:
+                if wedge3d and sign < 0:
+                    print("[validate] rotational periodic: negative wedge "
+                          "angle pairs cleanly")
+                break
+        else:
             sys.exit(f"validation FAILED:\n{log[-1500:]}")
         for ln in log.splitlines():
             if "Matched" in ln:

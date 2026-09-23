@@ -17,6 +17,7 @@ Self-test (no solver, no window):
 
 import csv
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -175,6 +176,7 @@ class MonitorApp:
         self.log_path = case_dir / "su2_run.log"
         self.tail = HistoryTail(case_dir / "history.csv")
         self.kind, self.total = parse_cfg_totals(self.cfg_path)
+        self.wedge = self._is_wedge(case_dir)
         self.t0 = time.time()
         self.proc = None
         self.running = False
@@ -182,6 +184,19 @@ class MonitorApp:
         self._build_ui()
         self._start_solver(threads)
         self.root.after(POLL_MS, self._tick)
+
+    @staticmethod
+    def _is_wedge(case_dir: Path) -> bool:
+        """True for 3D conical-wedge cases (real sector mass flow, not
+        per-unit-depth)."""
+        cj = case_dir / "case.json"
+        if not cj.exists():
+            return False
+        try:
+            case = json.loads(cj.read_text())
+        except (OSError, ValueError):
+            return False
+        return "hub" in (case.get("markers") or {})
 
     # ---------------- UI
     def _build_ui(self):
@@ -202,9 +217,11 @@ class MonitorApp:
         self.ax_res = self.fig.add_subplot(gs[0])
         self.ax_force = self.fig.add_subplot(gs[1], sharex=self.ax_res)
         self.ax_mass = self.fig.add_subplot(gs[2], sharex=self.ax_res)
+        mass_title = ("mass flow (wedge sector)  [kg/s]" if self.wedge
+                      else "mass flow per unit depth  [kg/(s·m)]")
         for ax, title in ((self.ax_res, "residuals (log10)"),
                           (self.ax_force, "force coefficients"),
-                          (self.ax_mass, "mass flow per unit depth  [kg/(s·m)]")):
+                          (self.ax_mass, mass_title)):
             ax.set_title(title, fontsize=9, loc="left")
             ax.grid(True, alpha=0.3)
         self.ax_res.set_yscale("linear")     # residuals are log10 values already
@@ -237,6 +254,21 @@ class MonitorApp:
 
     # ---------------- polling
     def _tick(self):
+        # a single bad tick must never cancel the polling loop: reschedule
+        # unconditionally and log any callback traceback to a file (with
+        # CREATE_NO_WINDOW the stderr is otherwise lost)
+        try:
+            self._tick_body()
+        except Exception:
+            import traceback
+            try:
+                with open(self.case_dir / "monitor_err.log", "a") as f:
+                    f.write(traceback.format_exc() + "\n")
+            except OSError:
+                pass
+        self.root.after(POLL_MS, self._tick)
+
+    def _tick_body(self):
         if self.running:
             self.tail.poll()
 
@@ -256,7 +288,6 @@ class MonitorApp:
             self.status.config(text=self.status.cget("text").split(
                 "   |   post-processing")[0] + "   |   results.json ready",
                 fg="green")
-        self.root.after(POLL_MS, self._tick)
 
     def _x_column(self):
         t = self.tail.get("Time_Iter")
@@ -301,7 +332,9 @@ class MonitorApp:
     def _draw_massflow(self, x):
         ax = self.ax_mass
         ax.clear()
-        ax.set_title("mass flow per unit depth  [kg/(s·m)]", fontsize=9, loc="left")
+        ax.set_title("mass flow (wedge sector)  [kg/s]" if self.wedge
+                     else "mass flow per unit depth  [kg/(s·m)]",
+                     fontsize=9, loc="left")
         ax.grid(True, alpha=0.3)
         mdot = None
         for col in ("SURFACE_MASSFLOW", "Avg_Massflow"):

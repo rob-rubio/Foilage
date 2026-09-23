@@ -13,7 +13,7 @@ MARKER_MONITORING covering all wall-type markers.  A case with
 ``boundary_mode == "freestream"`` maps every outer marker to MARKER_FAR.
 
 Supported marker bc types: inlet, outlet, farfield, wall_adiabatic,
-wall_isothermal (needs "temperature"), symmetry.
+wall_isothermal (needs "temperature"), slip, symmetry.
 """
 
 import json
@@ -45,25 +45,44 @@ def is_freestream_case(case):
 
 
 def marker_lines(markers, fs):
+    # SU2 v8 rejects the same config option appearing twice, so every BC
+    # type is grouped into exactly ONE line carrying all its markers
+    # (multi-marker pair format: marker, value, marker, value, ...).
     groups = {}
     for name, spec in markers.items():
         groups.setdefault(spec["bc"], []).append(name)
 
     lines = []
-    for name in groups.get("inlet", []):
-        d = markers[name].get("direction", [1.0, 0.0, 0.0])
-        lines.append(f"MARKER_INLET= ( {name}, {fmt(fs['T0'])}, {fmt(fs['p0'])}, "
-                     f"{fmt(d[0])}, {fmt(d[1])}, {fmt(d[2])} )")
-    for name in groups.get("outlet", []):
-        lines.append(f"MARKER_OUTLET= ( {name}, {fmt(fs['p_inf'])} )")
+    inlets = groups.get("inlet", [])
+    if inlets:
+        pairs = ", ".join(
+            f"{name}, {fmt(fs['T0'])}, {fmt(fs['p0'])}, "
+            f"{fmt(markers[name].get('direction', [1.0, 0.0, 0.0])[0])}, "
+            f"{fmt(markers[name].get('direction', [1.0, 0.0, 0.0])[1])}, "
+            f"{fmt(markers[name].get('direction', [1.0, 0.0, 0.0])[2])}"
+            for name in inlets)
+        lines.append(f"MARKER_INLET= ( {pairs} )")
+    outlets = groups.get("outlet", [])
+    if outlets:
+        lines.append("MARKER_OUTLET= ( "
+                     + ", ".join(f"{name}, {fmt(fs['p_inf'])}"
+                                 for name in outlets) + " )")
     if groups.get("farfield"):
         lines.append("MARKER_FAR= ( " + ", ".join(groups["farfield"]) + " )")
-    for name in groups.get("wall_adiabatic", []):
-        lines.append(f"MARKER_HEATFLUX= ( {name}, 0.0 )")
-    for name in groups.get("wall_isothermal", []):
-        lines.append(f"MARKER_ISOTHERMAL= ( {name}, {fmt(markers[name]['temperature'])} )")
+    adiabatic = groups.get("wall_adiabatic", [])
+    if adiabatic:
+        lines.append("MARKER_HEATFLUX= ( "
+                     + ", ".join(f"{name}, 0.0" for name in adiabatic)
+                     + " )")
+    isothermal = groups.get("wall_isothermal", [])
+    if isothermal:
+        lines.append("MARKER_ISOTHERMAL= ( "
+                     + ", ".join(f"{name}, {fmt(markers[name]['temperature'])}"
+                                 for name in isothermal) + " )")
     if groups.get("symmetry"):
         lines.append("MARKER_SYM= ( " + ", ".join(groups["symmetry"]) + " )")
+    if groups.get("slip"):
+        lines.append("MARKER_EULER= ( " + ", ".join(groups["slip"]) + " )")
 
     walls = [n for n, s in markers.items() if s["bc"] in WALL_TYPES]
     if walls:
@@ -102,14 +121,41 @@ def cascade_marker_lines(case):
         for pair in cas.get("periodic", []):
             a, b = pair["markers"]
             zero3 = "0.0, 0.0, 0.0"
-            # full precision: the periodic pairing tolerance is far tighter than fmt()
-            trans = ", ".join(repr(float(v)) for v in pair["translation"])
-            lines.append(f"MARKER_PERIODIC= ( {a}, {b}, {zero3}, {zero3}, {trans} )")
+            if pair.get("rotation_deg"):
+                # rotational pair (conical wedge): v8 11-token format with
+                # rotation about the stored axis (degrees), zero translation
+                center = ", ".join(repr(float(v)) for v in
+                                   pair.get("center", (0.0, 0.0, 0.0)))
+                ax, ay, az = pair.get("axis", (1.0, 0.0, 0.0))
+                deg = float(pair["rotation_deg"])
+                rot = ", ".join(repr(deg * v) for v in (ax, ay, az))
+                trans = ", ".join(repr(float(v)) for v in
+                                  pair.get("translation", (0.0, 0.0, 0.0)))
+                lines.append(f"MARKER_PERIODIC= ( {a}, {b}, {center}, "
+                             f"{rot}, {trans} )")
+            else:
+                # full precision: the periodic pairing tolerance is far
+                # tighter than fmt()
+                trans = ", ".join(repr(float(v)) for v in pair["translation"])
+                lines.append(f"MARKER_PERIODIC= ( {a}, {b}, {zero3}, "
+                             f"{zero3}, {trans} )")
 
+    # SU2 v8 rejects duplicated config options: group every wall marker
+    # into a single MARKER_HEATFLUX / MARKER_ISOTHERMAL line
     markers = case.get("markers", {})
-    for name, spec in markers.items():
-        if spec["bc"] in WALL_TYPES:
-            lines.append(f"MARKER_HEATFLUX= ( {name}, 0.0 )")
+    adiabatic = [n for n, s in markers.items() if s["bc"] == "wall_adiabatic"]
+    if adiabatic:
+        lines.append("MARKER_HEATFLUX= ( "
+                     + ", ".join(f"{n}, 0.0" for n in adiabatic) + " )")
+    isothermal = [n for n, s in markers.items()
+                  if s["bc"] == "wall_isothermal"]
+    if isothermal:
+        lines.append("MARKER_ISOTHERMAL= ( "
+                     + ", ".join(f"{n}, {fmt(markers[n]['temperature'])}"
+                                 for n in isothermal) + " )")
+    slip = [n for n, s in markers.items() if s["bc"] == "slip"]
+    if slip:
+        lines.append("MARKER_EULER= ( " + ", ".join(slip) + " )")
     # In external flow, every edge around the fluid domain is farfield.  The
     # mesh retains separate names for the former inlet/outlet edges so that
     # old meshes remain usable, but SU2 must receive one complete MARKER_FAR
@@ -180,6 +226,8 @@ def main():
         "REYNOLDS_LENGTH": fmt(physics.get("reynolds_length", 1.0)),
         "GAMMA": fmt(physics.get("gamma", 1.4)),
         "GAS_CONSTANT": fmt(physics.get("gas_constant", 287.058)),
+        "REF_AREA_LINE": ("REF_AREA= " + fmt(physics["ref_area"])
+                          if physics.get("ref_area") else ""),
         "T_INF": fmt(fs["T_inf"]),
         "P_INF": fmt(fs["p_inf"]),
         "T0": fmt(fs["T0"]),

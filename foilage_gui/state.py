@@ -188,6 +188,50 @@ class CaseState:
                      f"R1 ({r1}) != R2 ({r2}): the mesh can be built, but "
                      "SU2 needs R1 = R2 for a single-translation periodic "
                      "pair."))
+        elif mode == "axisymmetric3d":
+            r1, r2 = self.get("domain.R1"), self.get("domain.R2")
+            h1, h2 = self.get("domain.h1"), self.get("domain.h2")
+            if h1 is None or h2 is None or h1 <= 0.0 or h2 <= 0.0:
+                issues.append(("error",
+                               "3D wedge mode needs positive streamtube "
+                               "depths h1 and h2 (same units as R1/R2)."))
+            elif r1 is not None and max(h1, h2) >= 1.6 * r1:
+                issues.append(("warning",
+                               f"Streamtube depth (up to {max(h1, h2)}) is "
+                               f"large vs the annulus radius R1 ({r1}): the "
+                               "quasi-2D wedge assumption degrades and the "
+                               "hub approaches the machine axis."))
+            # quasi-1D feasibility of the BC pair on the expanding
+            # streamtube: A2/A1 > 1 diffuses the subsonic flow, so p_out
+            # below ~the choking floor has no steady solution - the run
+            # pressurizes the domain instead and 'converges' to a
+            # stagnant field
+            p01 = self.get("BCs.inlet.total pressure")
+            p2o = self.get("BCs.outlet.static pressure")
+            if None not in (r1, r2, h1, h2, p01, p2o) and r1 > 0 and h1 > 0:
+                from tools.setup_cascade_case import streamtube_exit_check
+                gamma_v, _src = self.effective_gamma()
+                chk = streamtube_exit_check(float(p01), float(p2o),
+                                            (float(r2) * float(h2))
+                                            / (float(r1) * float(h1)),
+                                            gamma_v)
+                if not chk["feasible"]:
+                    issues.append((
+                        "error",
+                        f"BCs infeasible for this streamtube: A2/A1 = "
+                        f"{chk['area_ratio']:.2f} expands the passage, so "
+                        f"p_out = {p2o:,.0f} Pa demands more mass flow "
+                        f"than the inlet can swallow (choking limit; "
+                        f"{chk['over_capacity']:.2f}x over capacity). The "
+                        "run will pressurize and choke instead of "
+                        f"accelerating. Raise p_out above ~"
+                        f"{chk['p2_min']:,.0f} Pa or contract A2/A1."))
+                elif chk["over_capacity"] > 0.9:
+                    issues.append((
+                        "warning",
+                        "p_out is close to the choking limit of this "
+                        "streamtube - expect a pressurized, near-stagnant "
+                        "passage."))
         elif mode == "freestream":
             ylo = self.get("domain.y_min")
             yhi = self.get("domain.y_max")
@@ -238,6 +282,14 @@ class CaseState:
         if r1 and n and self.get("domain.R2"):
             d["pitch_te_m"] = 2.0 * math.pi * float(self.get("domain.R2")) \
                 * units_to_m / n
+        if (self.get("domain.periodicity") == "axisymmetric3d" and r1
+                and self.get("domain.h1") and self.get("domain.h2")):
+            # streamtube area change across the row (2 pi R cancels):
+            # A2/A1 = (R2 h2) / (R1 h1) - contraction when < 1
+            r2 = float(self.get("domain.R2"))
+            area_ratio = (r2 * float(self.get("domain.h2"))
+                          / (r1 * float(self.get("domain.h1"))))
+            d["streamtube_area_ratio"] = area_ratio
         if None not in (p01, T01, p2) and p01 and p2 and p2 < p01:
             g = gamma
             T2 = T01 * (p2 / p01) ** ((g - 1) / g)

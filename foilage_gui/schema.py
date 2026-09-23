@@ -63,6 +63,8 @@ MESH_ALGORITHMS = [_c("6 - Frontal-Delaunay (recommended)", 6),
                    _c("7 - BAMG", 7),
                    _c("8 - Frontal-Delaunay for Quads", 8),
                    _c("9 - Packing of Parallelograms", 9)]
+CONV_CRITERIA = [_c("Density + energy residuals (recommended)", "density_energy"),
+                 _c("Density only (legacy)", "density")]
 
 
 SECTIONS = [
@@ -107,8 +109,18 @@ SECTIONS = [
                           "700 K)."),
         FieldSpec("solver_settings.max_iterations", "Max iterations", "int",
                   6000, 100, 100000, step=100,
-                  tooltip="SU2 stops earlier once CONV_RESIDUAL_MINVAL is "
-                          "reached for all fields."),
+                  tooltip="SU2 stops earlier once every convergence-field "
+                          "residual is below CONV_RESIDUAL_MINVAL."),
+        FieldSpec("solver_settings.convergence_criterion",
+                  "Convergence criterion", "choice", "density_energy",
+                  choices=CONV_CRITERIA,
+                  tooltip="Residuals SU2 must drive below the convergence "
+                          "floor before the run stops (ALL of them). "
+                          "Density + energy prevents a false 'converged' "
+                          "while the energy equation is still unconverged "
+                          "- recommended for 3D wedge cases, which can "
+                          "pressurize and choke while the density residual "
+                          "looks clean."),
         FieldSpec("solver_settings.restart", "Initialize from previous solution",
                   "bool", False,
                   tooltip="Warm-start the solve from restart.dat in the case "
@@ -251,6 +263,8 @@ SECTIONS = [
                   choices=[
                       _c("Axisymmetric periodics (unwrapped annulus)",
                          "axisymmetric"),
+                      _c("Axisymmetric 3D wedge (conical streamtube)",
+                         "axisymmetric3d"),
                       _c("Offset periodics (linear cascade)", "offset"),
                       _c("Freestream boundaries (isolated airfoil)",
                          "freestream")],
@@ -259,11 +273,18 @@ SECTIONS = [
                           "N) and the tangential coordinate is the arc "
                           "length 'uy'; imported/exported geomTurbo y is "
                           "Cartesian and is unwrapped/re-wrapped "
-                          "automatically. offset: a linear cascade - "
-                          "constant pitch, straight periodic lines, y is "
-                          "Cartesian (no unwrap). freestream: no periodics "
-                          "- the upper/lower boundaries are far-field "
-                          "lines for isolated-airfoil calculations."),
+                          "automatically. axisymmetric3d: the same "
+                          "unwrapped sector solved as a true 3D conical "
+                          "wedge - the depth h(x) varies axially between "
+                          "h1/h2 (logistic, mimicking streamtube "
+                          "contraction), hub/shroud are free-slip walls, the "
+                          "periodics are rotational (R1 != R2 is legal), "
+                          "and the mesh is extruded spanwise. offset: a "
+                          "linear cascade - constant pitch, straight "
+                          "periodic lines, y is Cartesian (no unwrap). "
+                          "freestream: no periodics - the upper/lower "
+                          "boundaries are far-field lines for "
+                          "isolated-airfoil calculations."),
         FieldSpec("domain.R1", "Annulus radius at LE (R1)", "float", 9.0,
                   0.01, 2000.0, slider=True, unit="mm",
                   tooltip="Actual annulus radius at the leading-edge axial "
@@ -276,9 +297,29 @@ SECTIONS = [
                   tooltip="Actual annulus radius at the trailing-edge axial "
                           "station, in the same units as axial chord. Sets "
                           "the pitch there: p_TE = 2 pi R2 / N. Must equal "
-                          "R1 for a single-translation periodic pair. "
+                          "R1 for a single-translation periodic pair; in "
+                          "axisymmetric3d mode R1 != R2 is allowed (the "
+                          "rotational wedge periodics support it). "
                           "Auto-filled when a geomTurbo file is imported. "
                           "Ignored in offset mode (constant pitch)."),
+        FieldSpec("domain.h1", "Streamtube depth at LE (h1)", "float", 4.0,
+                  0.01, 2000.0, slider=True, unit="mm",
+                  tooltip="3D wedge mode only: streamtube span (depth) at "
+                          "the leading edge, in the same units as R1/R2. "
+                          "The mesh spans r = R(x) -/+ h(x)/2. Held "
+                          "constant fore of the LE."),
+        FieldSpec("domain.h2", "Streamtube depth at TE (h2)", "float", 4.0,
+                  0.01, 2000.0, slider=True, unit="mm",
+                  tooltip="3D wedge mode only: streamtube span (depth) at "
+                          "the trailing edge, in the same units as R1/R2. "
+                          "Interpolated from h1 with a logistic over the "
+                          "blade (streamtube contraction) and held "
+                          "constant aft of the TE."),
+        FieldSpec("domain.h_steepness", "Depth logistic steepness",
+                  "float", 10.0, 2.0, 40.0, step=0.5,
+                  tooltip="3D wedge mode only: steepness of the logistic "
+                          "h(x) transition between the LE and TE (10 = "
+                          "transition spans about the full axial chord)."),
         FieldSpec("domain.airfoil_count", "Blade count N", "int", 45,
                   2, 300, step=1,
                   tooltip="Blades around the full annulus; pitch = 2 pi R / N."),
@@ -345,6 +386,19 @@ SECTIONS = [
         FieldSpec("mesh.boundary_layer.n_layers", "Layer count", "int", 14,
                   2, 60, step=1,
                   tooltip="Number of structured wall-normal layers."),
+    ]),
+    Section("mesh", "Spanwise extrusion (3D wedge)", [
+        FieldSpec("mesh.span.layers", "Spanwise node layers", "int", 21,
+                  2, 81, step=2,
+                  tooltip="axisymmetric3d only: node layers through the "
+                          "streamtube depth. Hub and shroud use free-slip "
+                          "walls, so there are no spanwise wall boundary "
+                          "layers to resolve. Cost scales with this count."),
+        FieldSpec("mesh.span.growth", "Spanwise growth", "float", 1.3,
+                  1.0, 2.0, slider=True,
+                  tooltip="axisymmetric3d only: two-sided geometric "
+                          "clustering of the spanwise layers toward both "
+                          "walls (1 = uniform spacing)."),
     ]),
     Section("mesh", "Wake refinement", [
         FieldSpec("mesh.wake.size", "Wake element size", "float", 0.02,

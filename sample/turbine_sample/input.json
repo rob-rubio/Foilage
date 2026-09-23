@@ -18,6 +18,7 @@
     "turbulence_model": "SST",
     "gamma": null,
     "max_iterations": 2000,
+    "convergence_criterion": "density_energy",
     "restart": false,
     "numerics": {
       "limiter": "NISHIKAWA_R3",
@@ -68,8 +69,12 @@
     "n_points": 1001
   },
   "domain": {
+    "periodicity": "axisymmetric",
     "R1": 1050.0,
     "R2": 1050.0,
+    "h1": 300.0,
+    "h2": 300.0,
+    "h_steepness": 10.0,
     "airfoil_count": 35,
     "x_min": -0.5,
     "x_max": 2.5
@@ -81,6 +86,10 @@
     "periodic_size": 0.015,
     "algorithm": 6,
     "airfoil_points": null,
+    "span": {
+      "layers": 21,
+      "growth": 1.3
+    },
     "boundary_layer": {
       "first_layer_height": 4e-05,
       "growth_rate": 1.25,

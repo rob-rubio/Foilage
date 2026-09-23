@@ -12,6 +12,8 @@ DERIVED_LABELS = [
     ("scale_m", "mesh scale", lambda v: f"1 chord unit = {v:.4g} m"),
     ("pitch_le_m", "pitch at LE", lambda v: f"{v:.4f} m"),
     ("pitch_te_m", "pitch at TE", lambda v: f"{v:.4f} m"),
+    ("streamtube_area_ratio", "streamtube area A2/A1 (3D)",
+     lambda v: f"{v:.3f}" + ("  (contraction)" if v < 1.0 else "")),
     ("pr", "pressure ratio p2/p01", lambda v: f"{v:.3f}"),
     ("M2", "isentropic exit Mach", lambda v: f"{v:.3f}"),
     ("V2", "isentropic exit speed", lambda v: f"{v:.1f} m/s"),

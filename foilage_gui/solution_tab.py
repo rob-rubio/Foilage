@@ -36,7 +36,8 @@ if str(TOOLS) not in sys.path:
 from run_monitor import HistoryTail, parse_cfg_totals  # noqa: E402
 from su2_vtk import read_legacy_vtk                    # noqa: E402
 from plot_case import (fields_from_volume, wall_points,  # noqa: E402
-                       surface_distributions, volume_triangulation)
+                       surface_distributions, volume_triangulation,
+                       periodic_plot_positions)
 
 from .widgets import Tooltip                           # noqa: E402
 
@@ -340,19 +341,21 @@ class SolutionTab(ttk.Frame):
             return
         values, cmap = self._fields[name]
         pts, conn = volume_triangulation(self._volume)
-        pitch = self._periodic_pitch()
-        shifts = (-pitch, 0.0, pitch) if pitch else (0.0,)
+        positions = periodic_plot_positions(self._volume,
+                                            self._periodic_pair())
         ax = self.ax
         tc = None
-        for dy in shifts:
-            tc = ax.tricontourf(pts[:, 0], pts[:, 1] + dy, conn, values,
+        for xy in positions:
+            tc = ax.tricontourf(xy[:, 0], xy[:, 1], conn, values,
                                 levels=40, cmap=cmap)
         ax.set_aspect("equal")
         ax.set_xlim(pts[:, 0].min(), pts[:, 0].max())
         ymin, ymax = pts[:, 1].min(), pts[:, 1].max()
-        if pitch:
-            ymin -= 0.45 * pitch
-            ymax += 0.45 * pitch
+        if len(positions) > 1:
+            offset = max(float(np.max(np.abs(xy[:, 1] - pts[:, 1])))
+                         for xy in positions)
+            ymin -= 0.45 * offset
+            ymax += 0.45 * offset
         ax.set_ylim(ymin, ymax)
         ax.set_title(name, fontsize=10)
         ax.set_xlabel("x")
@@ -361,31 +364,31 @@ class SolutionTab(ttk.Frame):
         self.fig.tight_layout()
         self.canvas.draw_idle()
 
-    def _periodic_pitch(self):
-        """Spanwise pitch of the case (y translation), 0 when unknown.
-
-        Cached per case.json mtime so a re-run with a different pitch is
-        picked up without a manual reload.
-        """
+    def _periodic_pair(self):
+        """Periodic transform from case.json, cached until the case changes."""
         case_path = self.app.state.case_dir() / "case.json"
         try:
             mtime = case_path.stat().st_mtime
         except OSError:
-            return 0.0
-        cached = getattr(self, "_pitch_cache", None)
+            return None
+        cached = getattr(self, "_periodic_cache", None)
         if cached is not None and cached[0] == mtime:
             return cached[1]
-        pitch = 0.0
+        pair = None
         try:
             case = json.loads(case_path.read_text())
             pers = (case.get("cascade") or {}).get("periodic") or []
             if pers:
-                pitch = float(
-                    (pers[0].get("translation") or [0, 0, 0])[1] or 0.0)
+                pair = pers[0]
         except Exception:
-            pitch = 0.0
-        self._pitch_cache = (mtime, pitch)
-        return pitch
+            pass
+        self._periodic_cache = (mtime, pair)
+        return pair
+
+    def _periodic_pitch(self):
+        """Translation pitch for the rectilinear streamline grid."""
+        pair = self._periodic_pair() or {}
+        return float((pair.get("translation") or [0, 0, 0])[1] or 0.0)
 
     def draw_surface(self):
         """1D surface distributions (SS/PS curves over u in [0, 1])."""
@@ -701,11 +704,19 @@ class SolutionTab(ttk.Frame):
             if p:
                 lines.append("")
                 lines.append(f"{plane}:")
-                lines.append(f"  mass flow  : "
-                             f"{p.get('mass_flow_kg_s_m', 0):.4f} kg/(s.m)")
-                lines.append(f"  corrected  : "
-                             f"{p.get('corrected_flow_kg_s_m', 0):.4f} "
-                             f"kg/(s.m)  (W*sqrt(theta)/delta)")
+                if "mass_flow_kg_s" in p:       # 3D wedge: real sector flow
+                    lines.append(f"  mass flow  : "
+                                 f"{p.get('mass_flow_kg_s', 0):.4f} kg/s "
+                                 f"(wedge sector)")
+                    lines.append(f"  corrected  : "
+                                 f"{p.get('corrected_flow_kg_s', 0):.4f} "
+                                 f"kg/s  (W*sqrt(theta)/delta)")
+                else:
+                    lines.append(f"  mass flow  : "
+                                 f"{p.get('mass_flow_kg_s_m', 0):.4f} kg/(s.m)")
+                    lines.append(f"  corrected  : "
+                                 f"{p.get('corrected_flow_kg_s_m', 0):.4f} "
+                                 f"kg/(s.m)  (W*sqrt(theta)/delta)")
                 lines.append(f"  Mach       : {p.get('mach', 0):.3f}")
                 lines.append(f"  velocity   : {p.get('velocity_m_s', 0):.1f} m/s")
                 lines.append(f"  flow angle : {p.get('flow_angle_deg', 0):+.2f} deg")
@@ -789,20 +800,27 @@ class SolutionTab(ttk.Frame):
                             "to write results.json ...")
 
     def _poll_live(self):
-        if self._job_solving and self._live_tail:
-            self._live_tail.poll()
-            self._draw_live()
-        elif self.mode_var.get() == "convergence":
-            # static convergence view: refresh when history.csv changes
-            # (e.g. a solve started outside the GUI)
-            hist = self.app.state.case_dir() / "history.csv"
-            try:
-                mtime = hist.stat().st_mtime
-            except OSError:
-                mtime = None
-            if mtime is not None and mtime != getattr(self, "_conv_mtime",
-                                                      None):
-                self.show_convergence()
+        # a single bad tick must never cancel the polling loop (the live
+        # plots would freeze permanently) - reschedule unconditionally
+        try:
+            if self._job_solving and self._live_tail:
+                self._live_tail.poll()
+                self._draw_live()
+            elif self.mode_var.get() == "convergence":
+                # static convergence view: refresh when history.csv changes
+                # (e.g. a solve started outside the GUI)
+                hist = self.app.state.case_dir() / "history.csv"
+                try:
+                    mtime = hist.stat().st_mtime
+                except OSError:
+                    mtime = None
+                if mtime is not None and mtime != getattr(self, "_conv_mtime",
+                                                          None):
+                    self.show_convergence()
+        except Exception:
+            import traceback
+            self.status_var.set("live view error - see console")
+            traceback.print_exc()
         self.after(LIVE_POLL_MS, self._poll_live)
 
     def _draw_live(self):
@@ -972,8 +990,7 @@ class SolutionTab(ttk.Frame):
                     transform=ax.transAxes, ha="center", fontsize=7,
                     color="0.4")
 
-    @staticmethod
-    def _panel_imbalance(ax, tail, x):
+    def _panel_imbalance(self, ax, tail, x):
         """Domain imbalances in % from per-surface mass-averaged fluxes."""
         ax.clear()
         ax.set_title("domain imbalance  [%]", fontsize=9, loc="left")
@@ -1015,16 +1032,22 @@ class SolutionTab(ttk.Frame):
             e_out = mo * T0o
             plotted.append(ax.plot(x, safe_ratio(e_in, -e_out), lw=1.1,
                                    color="tab:red", label="energy (h0)")[0])
-        # momentum-flux density: rho*Vn^2 + p (mass-averaged); the passage
-        # areas at inlet/outlet are equal (R1 == R2) so they cancel in the
-        # ratio. NOTE: this settles at a constant equal to the blade axial
-        # force, NOT at zero.
+        # momentum-flux density: rho*Vn^2 + p (mass-averaged). The passage
+        # areas at inlet/outlet are equal (R1 == R2) in the 2D modes so
+        # they cancel in the ratio; the 3D wedge carries a streamtube
+        # contraction, so the exit flux is scaled by A2/A1 = R2 h2/(R1 h1).
+        # NOTE: this settles at a constant equal to the blade axial force,
+        # NOT at zero.
         rho_i, rho_o = arr("Avg_Density")
         vn_i, vn_o = arr("Avg_NormalVel")
         p_i, p_o = arr("Avg_Press")
         if rho_i is not None and vn_i is not None and p_i is not None:
             f_in = rho_i * vn_i ** 2 + p_i
             f_out = rho_o * vn_o ** 2 + p_o
+            area_ratio = self.app.state.derived().get(
+                "streamtube_area_ratio")
+            if area_ratio:
+                f_out = np.asarray(f_out, dtype=float) * area_ratio
             plotted.append(ax.plot(x, safe_ratio(f_in, f_out), lw=1.1,
                                    color="tab:green",
                                    label="momentum flux")[0])

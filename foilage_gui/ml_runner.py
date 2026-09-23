@@ -182,7 +182,10 @@ class MLSamplingRun:
         if any("airfoil_source.morph." in c and "@" in c
                for c in xvalues):
             set_path(cfg, "airfoil_source.morph.enabled", True)
-        if get_path(cfg, "domain.R1") is not None:
+        # pitch exploration must keep the SU2 single-translation pair valid
+        # (the 3D wedge's rotational pair instead supports R1 != R2)
+        if get_path(cfg, "domain.R1") is not None and \
+                get_path(cfg, "domain.periodicity") != "axisymmetric3d":
             set_path(cfg, "domain.R2", get_path(cfg, "domain.R1"))
         if self.max_iterations:
             set_path(cfg, "solver_settings.max_iterations",

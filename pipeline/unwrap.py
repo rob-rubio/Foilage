@@ -9,6 +9,13 @@
   plugin sections are in *Cartesian* y (y = R * sin(theta) around the
   machine axis), so they are unwrapped on import and re-wrapped on export
   - see cartesian_to_uy / uy_to_cartesian.
+- ``axisymmetric3d`` - the same unwrapped blade-to-blade plane, extruded
+  into a true conical wedge sector: every 2D node is wrapped back to polar
+  coordinates at ``theta = uy / R(x)`` and stacked spanwise between the
+  streamtube walls ``r = R(x) -/+ h(x)/2``, where h(x) is the axially
+  varying streamtube depth (see pipeline/extrude3d.py). The hub/shroud
+  walls are free-slip and the periodic pair is rotational (2 pi / N about
+  the machine axis), so R1 != R2 is solver-legal in this mode.
 - ``offset``        - a linear cascade: constant pitch, straight periodic
   lines with no tangential offset; y is Cartesian, nothing is unwrapped.
 - ``freestream``    - no periodics at all: the upper/lower domain
@@ -21,14 +28,23 @@ units (radius / axial_chord for the normalized arrays).
 
 import numpy as np
 
-PERIODICITY_MODES = ("axisymmetric", "offset", "freestream")
+PERIODICITY_MODES = ("axisymmetric", "axisymmetric3d", "offset", "freestream")
 DEFAULT_MODE = "axisymmetric"
+
+# Modes whose mesh plane is the unwrapped blade-to-blade surface (Cartesian
+# y <-> uy conversions apply on import/export).
+UNWRAPPED_MODES = ("axisymmetric", "axisymmetric3d")
 
 
 def periodicity_of(dom_cfg):
     """The selected periodicity mode (validated, defaults axisymmetric)."""
     mode = (dom_cfg or {}).get("periodicity", DEFAULT_MODE)
     return mode if mode in PERIODICITY_MODES else DEFAULT_MODE
+
+
+def is_unwrapped(dom_cfg):
+    """True when the mesh plane is the unwrapped blade-to-blade surface."""
+    return periodicity_of(dom_cfg) in UNWRAPPED_MODES
 
 
 def is_periodic(dom_cfg):

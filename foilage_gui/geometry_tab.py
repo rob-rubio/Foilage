@@ -132,11 +132,16 @@ def _compute_geometry(cfg):
 
         a1 = cfg.get("airfoil", {}).get("alpha1")
         a2 = cfg.get("airfoil", {}).get("alpha2")
+        h_profile = None
+        if prof.get("mode") == "axisymmetric3d":
+            xs_h = np.linspace(x0, x1, 201)
+            h_profile = (xs_h, np.asarray(prof["h"](xs_h), dtype=float))
         return {
             "ss": ss, "ps": ps, "outline": outline,
             "bot": bot, "top": top, "ghost_p": ghost_p, "ghost_m": ghost_m,
             "mode": prof.get("mode", "axisymmetric"),
             "periodic": prof.get("periodic", True),
+            "h_profile": h_profile,
             "style": airfoil["style"], "ss_upper": airfoil["ss_upper"],
             "n_points": len(ss), "x0": x0, "x1": x1,
             "turning": (float(a1) - float(a2))
@@ -261,6 +266,7 @@ class GeometryTab(ttk.Frame):
         self.metrics_var = tk.StringVar(value="")
         tk.Label(vpane, textvariable=self.metrics_var, anchor="w",
                  font=("Consolas", 8)).pack(fill="x")
+        self._h_ax = None               # twinned h(x) axis of the preview
 
         charts = ttk.Notebook(vpane)
         vpane.add(charts, weight=2)
@@ -852,6 +858,14 @@ class GeometryTab(ttk.Frame):
                 "freestream mode - cascade throat metrics not applicable")
             return
         t = g["throat"]
+        extra = ""
+        if g.get("mode") == "axisymmetric3d":
+            dom = self.app.state.config.get("domain") or {}
+            ac = float(self.app.state.get("airfoil.axial_chord") or 1.0)
+            h1, h2 = dom.get("h1"), dom.get("h2")
+            if h1 is not None and h2 is not None:
+                extra = (f"   |   3D wedge h1 {h1} h2 {h2} "
+                         f"({h1 / ac:.3f} -> {h2 / ac:.3f} c_ax)")
         self.metrics_var.set(
             f"throat {t['width']:.4f} c_ax ({t['width'] * scale_mm:.2f} mm) "
             f"@ x/c_ax {t['x_over_cax']:.3f}   |   "
@@ -861,7 +875,7 @@ class GeometryTab(ttk.Frame):
             f"(metal {g.get('angle_metal_inlet_deg', 0):.1f}/"
             f"{g.get('angle_metal_exit_deg', 0):.1f} deg)   |   "
             f"\u03b1_throat {t['angle_throat_deg']:.1f}\u00b0   |   "
-            f"unguided {t['unguided_turning_deg']:.1f}\u00b0")
+            f"unguided {t['unguided_turning_deg']:.1f}\u00b0" + extra)
 
     # -------------------------------------------------------------- draw
     def _draw(self, g):
@@ -924,6 +938,23 @@ class GeometryTab(ttk.Frame):
             ax.annotate("throat", ss[i], textcoords="offset points",
                         xytext=(6, -12), fontsize=8, color="tab:green")
 
+        # 3D wedge: streamtube depth h(x) on a secondary axis. ax.clear()
+        # does not touch twinned axes, so drop the previous one explicitly
+        # or every refresh would stack another h(x) curve on top.
+        if self._h_ax is not None:
+            self._h_ax.remove()
+            self._h_ax = None
+        ax_h = None
+        if g.get("h_profile") is not None:
+            xs_h, hs = g["h_profile"]
+            ax_h = self._h_ax = ax.twinx()
+            ax_h.plot(xs_h, hs, color="#d97706", lw=1.6, ls="-.",
+                      label="depth h(x) (3D wedge)")
+            ax_h.set_ylabel("h(x) / axial chord", color="#b45309", fontsize=9)
+            ax_h.tick_params(axis="y", colors="#b45309")
+            ax_h.set_ylim(0.0, max(float(np.max(hs)) * 1.6, 1e-6))
+            ax_h.grid(False)
+
         ax.set_aspect("equal")
         pad = 0.15
         ax.set_xlim(g["x0"] - pad, g["x1"] + pad)
@@ -933,9 +964,15 @@ class GeometryTab(ttk.Frame):
         ax.grid(True, alpha=0.25)
         ax.set_xlabel("x / axial chord")
         ax.set_ylabel("y / axial chord")
-        ax.set_title("Turbine cascade passage (normalized: axial chord = 1)",
-                     fontsize=10)
-        ax.legend(fontsize=8, loc="upper right")
+        mode_lbl = (" - conical wedge, slip hub/shroud"
+                    if g.get("mode") == "axisymmetric3d" else "")
+        ax.set_title("Turbine cascade passage (normalized: axial chord = 1)"
+                     + mode_lbl, fontsize=10)
+        handles, labels = ax.get_legend_handles_labels()
+        if ax_h is not None:
+            h2, l2 = ax_h.get_legend_handles_labels()
+            handles, labels = handles + h2, labels + l2
+        ax.legend(handles, labels, fontsize=8, loc="upper right")
         self.fig.tight_layout()
         self.canvas.draw_idle()
 

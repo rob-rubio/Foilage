@@ -10,9 +10,9 @@ heights) is expressed in these axial-chord units.
 import numpy as np
 
 try:
-    from unwrap import periodicity_of
+    from unwrap import is_unwrapped
 except ImportError:                                  # package-style import
-    from pipeline.unwrap import periodicity_of
+    from pipeline.unwrap import is_unwrapped
 
 
 def build_geometry(cfg):
@@ -98,14 +98,15 @@ def _imported_section_unwrap(cfg):
     """Cartesian-y -> uy converter for imported/plugin sections, or None
     when no unwrapping applies.
 
-    Only the axisymmetric mode unwraps: imported sections (geomTurbo
-    machine coordinates) and plugin output come in Cartesian y around
-    the machine axis, while the mesh plane uses the arc-length
-    unwrapped y (see pipeline/unwrap.py). The conversion radius is the
-    annulus radius R1 in axial-chord units. In offset mode y is
-    Cartesian already; freestream has no periodics at all."""
+    Only the unwrapped modes (axisymmetric / axisymmetric3d) unwrap:
+    imported sections (geomTurbo machine coordinates) and plugin output
+    come in Cartesian y around the machine axis, while the mesh plane
+    uses the arc-length unwrapped y (see pipeline/unwrap.py). The
+    conversion radius is the annulus radius R1 in axial-chord units. In
+    offset mode y is Cartesian already; freestream has no periodics at
+    all."""
     dom = cfg.get("domain") or {}
-    if periodicity_of(dom) != "axisymmetric":
+    if not is_unwrapped(dom):
         return None
     r1 = dom.get("R1")
     ac = float(cfg.get("airfoil", {}).get("axial_chord") or 1.0)

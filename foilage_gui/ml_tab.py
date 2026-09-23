@@ -275,10 +275,15 @@ class MLTab(ttk.Frame):
         self._x_specs = design_variables_for(
             self.app.state.get("airfoil_source.type") or "pyturbo",
             morph_n=int(self.app.state.get("airfoil_source.morph.n") or 0)
-            if self.app.state.get("airfoil_source.morph.n") else 0)
+            if self.app.state.get("airfoil_source.morph.n") else 0,
+            wedge=(self.app.state.get("domain.periodicity")
+                   == "axisymmetric3d"))
         freestream = (self.app.state.get("domain.periodicity")
                       or "axisymmetric") == "freestream"
-        self._y_specs = constraint_quantities_for_case(freestream)
+        self._y_specs = constraint_quantities_for_case(
+            freestream,
+            wedge=self.app.state.get("domain.periodicity")
+            == "axisymmetric3d")
         self.x_list.delete(0, "end")
         self.y_list.delete(0, "end")
         for spec in self._x_specs:

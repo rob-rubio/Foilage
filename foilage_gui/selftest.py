@@ -100,15 +100,29 @@ def test_gamma_model():
 
 def test_cascade_initialization():
     """Startup state is pressure-balanced and lower-flow than the reference."""
-    from tools.setup_cascade_case import cascade_flow_states
+    from tools.setup_cascade_case import cascade_flow_states, load_conv_fields
 
     s = cascade_flow_states(125000.0, 700.0, 81266.7, 1.36383165686)
     assert s["mach_init"] < s["mach_exit"]
     assert s["mach_init"] <= 0.2
     assert abs(s["init_pressure"] - 81266.7) < 1e-8
     assert abs(s["init_temperature"] - s["temperature_exit"]) < 1e-8
+
+    # convergence criterion: GUI choice -> SU2 CONV_FIELD entries. The
+    # default demands the energy residual too, so a choked/pressurizing
+    # run cannot stop on the density residual alone
+    assert "solver_settings.convergence_criterion" in FIELDS_BY_PATH
+    assert load_conv_fields({}) == ["RMS_DENSITY", "RMS_ENERGY"]
+    assert load_conv_fields({"solver_settings": {
+        "convergence_criterion": "density"}}) == ["RMS_DENSITY"]
+    try:
+        load_conv_fields({"solver_settings": {
+            "convergence_criterion": "bogus"}})
+        raise AssertionError("bogus criterion must be rejected")
+    except SystemExit:
+        pass
     print(f"cascade init OK (Mexit={s['mach_exit']:.3f}, "
-          f"Minit={s['mach_init']:.3f})")
+          f"Minit={s['mach_init']:.3f}; conv criterion mapped)")
 
 
 def test_geomturbo_import():
@@ -1015,6 +1029,9 @@ def test_periodicity_modes():
     if inputs:
         from foilage_gui.state import CaseState
         st = CaseState(inputs[0])
+        # the first case on disk may be a 3D wedge case (R1 != R2 legal
+        # there), so pin the 2D translation mode for this check
+        st.set("domain.periodicity", "axisymmetric")
         st.set("domain.R2", st.get("domain.R1") + 1.0)
         assert any("R1" in m for _s, m in st.validate())
         st.set("domain.periodicity", "offset")
@@ -1266,6 +1283,244 @@ def test_ml():
     print("ml OK (store roundtrip, MLP train/predict, sampler writer)")
 
 
+def test_axisymmetric3d():
+    """3D conical-wedge mode: the logistic depth law, the wedge extrusion
+    (orientation, periodic congruence, markers), the 3D SU2 writer + GUI
+    reader, scaling of 3D meshes, the rotational cfg markers, and the
+    wedge validation/derived/DV/objective handling."""
+    import shutil
+    from collections import OrderedDict
+
+    from pipeline.extrude3d import extrude_wedge, span_fractions
+    from pipeline.mesh_tris import pitch_profile
+
+    # ---- depth law: clamped logistic between LE and TE
+    af = {"ss": np.column_stack([np.linspace(0, 1, 50),
+                                 np.linspace(0.05, -0.05, 50)]),
+          "ps": np.column_stack([np.linspace(0, 1, 50),
+                                 np.linspace(-0.05, 0.05, 50)]),
+          "axial_chord": 100.0}
+    dom = {"periodicity": "axisymmetric3d", "R1": 90.0, "R2": 110.0,
+           "h1": 60.0, "h2": 30.0, "h_steepness": 10.0,
+           "airfoil_count": 45, "x_min": -0.5, "x_max": 2.5}
+    prof = pitch_profile(dom, af)
+    x_le, x_te = prof["x_le"], prof["x_te"]
+    assert abs(float(prof["h"](x_le - 1.0)) - 0.60) < 1e-12   # fore: h1
+    assert abs(float(prof["h"](x_te + 1.0)) - 0.30) < 1e-12   # aft: h2
+    assert abs(float(prof["h"](0.5 * (x_le + x_te))) - 0.45) < 1e-9
+    assert float(prof["h"](0.99)) > float(prof["h"](0.999)) > 0.30  \
+        # monotone towards h2
+    assert float(prof["h"](1.0)) == 0.30                       # exact clamp
+    assert abs(float(prof["radius"](x_le - 1.0)) - 0.70) < 1e-12
+    assert abs(float(prof["radius"](x_te + 1.0)) - 1.30) < 1e-12
+
+    # ---- extrude a synthetic strip: uy = R(x) * y * (2 pi / N)
+    nx, ny, L = 7, 5, 5
+    dth = 2.0 * np.pi / 45.0
+    xs, ys = np.linspace(0, 2, nx), np.linspace(0, 1, ny)
+
+    def nid(i, j):
+        return i * ny + j
+
+    verts = np.array([[x, float(prof["radius"](x)) * y * dth]
+                      for x in xs for y in ys])
+    quads = [[nid(i, j), nid(i + 1, j), nid(i + 1, j + 1), nid(i, j + 1)]
+             for i in range(nx - 1) for j in range(ny - 1)]
+    markers = {
+        "periodic_bottom": [(nid(i, 0), nid(i + 1, 0))
+                            for i in range(nx - 1)],
+        "periodic_top": [(nid(i + 1, ny - 1), nid(i, ny - 1))
+                         for i in range(nx - 1)],
+        "inlet": [(nid(0, j), nid(0, j + 1)) for j in range(ny - 1)],
+        "outlet": [(nid(nx - 1, j), nid(nx - 1, j + 1))
+                   for j in range(ny - 1)],
+        # interior row of element edges plays the airfoil wall
+        "airfoil": [(nid(i, 2), nid(i + 1, 2)) for i in range(nx - 1)],
+    }
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        m2d = tmp / "mesh_quad.su2"
+        with open(m2d, "w") as f:
+            f.write("NDIME= 2\n")
+            f.write(f"NELEM= {len(quads)}\n")
+            for q in quads:
+                f.write("9 %d %d %d %d\n" % tuple(q))
+            f.write(f"NPOIN= {len(verts)}\n")
+            for i, (x, y) in enumerate(verts):
+                f.write("%.17g %.17g %d\n" % (x, y, i))
+            f.write(f"NMARK= {len(markers)}\n")
+            for name, edges in markers.items():
+                f.write(f"MARKER_TAG= {name}\n")
+                f.write(f"MARKER_ELEMS= {len(edges)}\n")
+                for a, b in edges:
+                    f.write("3 %d %d\n" % (a, b))
+
+        m3d = tmp / "mesh_quad3d.su2"
+        st = extrude_wedge(m2d, prof, m3d, n_layers=L, growth=1.2)
+        assert st["periodic_max_mismatch"] < 1e-12
+        assert st["min_cell_volume"] > 0.0
+        assert st["hexes"] == (nx - 1) * (ny - 1) * (L - 1) and st["prisms"] == 0
+        assert st["markers"]["hub"] == (nx - 1) * (ny - 1)
+        assert st["markers"]["shroud"] == (nx - 1) * (ny - 1)
+        assert st["markers"]["airfoil"] == (nx - 1) * (L - 1)
+
+        # ---- GUI reader: mid-span layer + marker traces
+        from foilage_gui.su2_mesh import read_su2_mesh
+        m = read_su2_mesh(m3d)
+        assert m["ndim"] == 3 and m["n_layers"] == L
+        assert m["hexes"] == st["hexes"]
+        assert len(m["points"]) == nx * ny
+        assert m["quads"] is not None and len(m["quads"]) == (nx - 1) * (ny - 1)
+        assert len(m["markers"]["inlet"]) == ny - 1
+        assert len(m["markers"]["outlet"]) == ny - 1
+        assert len(m["markers"]["periodic_bottom"]) == nx - 1
+        # the synthetic airfoil row is interior to the strip, so only real
+        # domain-boundary markers trace on the mid-span layer
+        assert len(m["markers"]["airfoil"]) == 0
+
+        # ---- 3D mesh scaling + mid-span airfoil probe (setup_cascade_case)
+        from setup_cascade_case import parse_airfoil_mesh, scale_mesh
+        # node 0: hub corner on the bottom periodic edge (snapped to
+        # uy = y_c - p/2), at the first x station
+        scale_mesh(m3d, 0.5)
+        with open(m3d) as f:
+            first_point = f.read().split("NPOIN=")[1].splitlines()[1]
+        coords = [float(v) for v in first_point.split()[:3]]
+        x0 = float(xs[0])
+        r_hub0 = float(prof["radius"](x0)) - 0.5 * float(prof["h"](x0))
+        uy0 = (float(np.asarray(prof["y_c"](x0)))
+               - 0.5 * float(np.asarray(prof["p"](x0))))
+        th0 = uy0 / float(prof["radius"](x0))
+        exp = (0.5 * x0,
+               0.5 * r_hub0 * np.sin(th0),
+               0.5 * r_hub0 * np.cos(th0))
+        assert all(abs(c - e) < 1e-12 for c, e in zip(coords, exp)), coords
+        pts3, af_nodes = parse_airfoil_mesh(m3d)
+        assert pts3.shape[1] == 3
+        assert len(af_nodes) == nx
+        # one node per x station (the mid-span layer, scaled by 0.5)
+        assert np.allclose(pts3[af_nodes, 0], 0.5 * xs)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- span distribution sanity (two-sided geometric clustering)
+    z = span_fractions(21, 1.3)
+    d = np.diff(z)
+    assert z[0] == 0.0 and abs(z[-1] - 1.0) < 1e-12
+    assert d[0] < d[len(d) // 2] and np.isclose(d[0], d[-1])
+
+    # ---- rotational periodic marker line (12 v8 tokens, x-axis degrees)
+    from render_config import cascade_marker_lines
+    case = {"boundary_mode": "cascade", "cascade": {
+        "inlet": {"marker": "inlet", "total_pressure": 125000.0,
+                  "total_temperature": 700.0, "direction": [1.0, 0.0, 0.0]},
+        "outlet": {"marker": "outlet", "static_pressure": 60000.0},
+        "pitch_le_m": 0.012, "pitch_te_m": 0.014,
+        "periodic": [{"markers": ["periodic_bottom", "periodic_top"],
+                      "center": [0.0, 0.0, 0.0], "axis": [1.0, 0.0, 0.0],
+                      "rotation_deg": -360.0 / 45.0,
+                      "translation": [0.0, 0.0, 0.0]}]},
+        "markers": OrderedDict([
+            ("airfoil", {"bc": "wall_adiabatic"}),
+            ("inlet", {"bc": "inlet", "analyze": True}),
+            ("outlet", {"bc": "outlet", "analyze": True}),
+            ("hub", {"bc": "slip"}),
+            ("shroud", {"bc": "slip"})])}
+    txt = cascade_marker_lines(case)
+    pline = next(ln for ln in txt.splitlines()
+                 if ln.startswith("MARKER_PERIODIC"))
+    toks = [t.strip() for t in pline.split("=", 1)[1].strip()[1:-1].split(",")]
+    # v8 format: marker, donor, rot center (3), rot angles (3), translation (3)
+    assert len(toks) == 11, toks
+    assert abs(float(toks[5]) + 360.0 / 45.0) < 1e-12   # rotation about x
+    assert all(abs(float(t)) < 1e-15 for t in toks[2:5] + toks[6:11])
+    # Only the airfoil is viscous; hub and shroud are slip walls.
+    hf = [ln for ln in txt.splitlines() if ln.startswith("MARKER_HEATFLUX")]
+    assert len(hf) == 1, hf
+    assert hf[0] == "MARKER_HEATFLUX= ( airfoil, 0.0 )", hf[0]
+    assert "MARKER_EULER= ( hub, shroud )" in txt
+    assert "MARKER_MONITORING= ( airfoil )" in txt
+
+    # ---- validation, derived quantities, DVs and objectives follow the mode
+    inputs = sorted((REPO / "cases").glob("*/input.json"))
+    if inputs:
+        st = CaseState(inputs[0])
+        st.set("domain.periodicity", "axisymmetric3d")
+        st.set("domain.R2", st.get("domain.R1") + 1.0)
+        assert not any("R1" in m for _s, m in st.validate()), \
+            "wedge mode must allow R1 != R2"
+        st.set("domain.h1", 0.0)
+        assert any(s == "error" for s, m in st.validate() if "h1" in m)
+        st.set("domain.h1", 4.0)
+        st.set("domain.h2", 3.0)
+        d = st.derived()
+        expect = (float(st.get("domain.R2")) * 3.0 /
+                  (float(st.get("domain.R1")) * 4.0))
+        assert abs(d["streamtube_area_ratio"] - expect) < 1e-12
+
+    from foilage_gui.optimizer import (design_variables_for,
+                                       constraint_quantities_for_case,
+                                       objectives_for_case)
+    dvw = [d["path"] for d in design_variables_for("pyturbo", wedge=True)]
+    for path in ("domain.R2", "domain.h1", "domain.h2"):
+        assert path in dvw, path
+    assert "domain.h1" not in [d["path"] for d in
+                               design_variables_for("pyturbo")]
+    objw = {o["path"] for o in objectives_for_case(wedge=True)}
+    assert "outlet.mass_flow_kg_s" in objw
+    assert "outlet.mass_flow_kg_s_m" not in objw
+    consw = {c["path"] for c in constraint_quantities_for_case(wedge=True)}
+    assert "inlet.corrected_flow_kg_s" in consw
+    print("axisymmetric3d OK (h(x) law, wedge extrusion, mid-span reader, "
+          "3D scaling, rotational periodics, wedge DVs/objectives)")
+
+
+def test_mesh3d_parser():
+    """3D-view boundary parser: fast 3D SU2 parse (volume block skipped),
+    quad+tri marker faces, and the 2D/3D file-type sniff."""
+    import shutil
+    import tempfile
+    from foilage_gui.mesh3d_view import is_3d_file, parse_boundary
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        p = tmp / "mini3d.su2"
+        with open(p, "w") as f:
+            f.write("NDIME= 3\nNELEM= 2\n")
+            f.write("12 0 1 2 3 4 5 6 7\n")     # volume: must be skipped
+            f.write("13 0 1 2 4 5 6\n")
+            f.write("NPOIN= 8\n")
+            coords = [(0, 0, 1), (0.1, 0, 1), (0.1, 0.1, 1), (0, 0.1, 1),
+                      (0, 0, 1.1), (0.1, 0, 1.1), (0.1, 0.1, 1.1),
+                      (0, 0.1, 1.1)]
+            for i, (x, y, z) in enumerate(coords):
+                f.write(f"{x} {y} {z} {i}\n")
+            f.write("NMARK= 3\n")
+            f.write("MARKER_TAG= hub\nMARKER_ELEMS= 1\n9 0 1 2 3\n")
+            f.write("MARKER_TAG= airfoil\nMARKER_ELEMS= 1\n5 4 5 6\n")
+            f.write("MARKER_TAG= empty\nMARKER_ELEMS= 0\n")
+
+        assert is_3d_file(p)
+        parsed = parse_boundary(p)
+        assert len(parsed["points"]) == 8
+        assert parsed["volume_elems"] == 2
+        assert parsed["markers"]["hub"] == [[0, 1, 2, 3]]
+        assert parsed["markers"]["airfoil"] == [[4, 5, 6]]
+        assert "empty" not in parsed["markers"]   # empty groups dropped
+
+        p2 = tmp / "flat.su2"
+        p2.write_text("NDIME= 2\nNELEM= 0\nNPOIN= 1\n0 0 0\n")
+        assert not is_3d_file(p2)
+        try:
+            parse_boundary(p2)
+            raise AssertionError("2D file must be rejected")
+        except ValueError:
+            pass
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("mesh3d parser OK (quad/tri faces, volume skip, 2D rejected)")
+
+
 def main():
     test_schema()
     test_state_roundtrip()
@@ -1279,12 +1534,14 @@ def main():
     test_plugins()
     test_optimizer_dvs()
     test_periodicity_modes()
+    test_axisymmetric3d()
     test_zweifel()
     test_warm_start_restart()
     test_ml()
     test_geomturbo_import()
     test_geomturbo_external_samples()
     test_su2_mesh_reader()
+    test_mesh3d_parser()
     test_postproc_integration()
     print("selftest OK")
 
