@@ -5,7 +5,7 @@ import sys
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import ttk
+from tkinter import messagebox, simpledialog, ttk
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -21,7 +21,11 @@ if str(REPO) not in sys.path:
 
 from .su2_mesh import read_su2_mesh, mesh_edges  # noqa: E402
 from .schema import sections_for                 # noqa: E402
+from .mesh_profiles import (PROTECTED, MeshProfiles, apply_values,  # noqa: E402
+                            capture_values)
 from .widgets import FieldWidget, ScrolledFrame  # noqa: E402
+
+PROFILE_CUSTOM = "(custom)"     # dropdown placeholder: values not from a profile
 
 MARKER_COLORS = {"airfoil": "#111111", "inlet": "#1f77b4",
                  "outlet": "#d62728", "periodic_bottom": "#2ca02c",
@@ -36,6 +40,7 @@ class MeshTab(ttk.Frame):
         self._load_queue = queue.Queue()
         self._current = None            # parsed mesh dict
         self._current_path = None
+        self.profiles = MeshProfiles()
 
         bar = ttk.Frame(self)
         bar.pack(fill="x", padx=4, pady=(4, 0))
@@ -88,6 +93,7 @@ class MeshTab(ttk.Frame):
         form_holder = ttk.Frame(pane)
         pane.add(form_holder, weight=1)
         self.fields = {}
+        self._build_profile_bar(form_holder)
         form = ScrolledFrame(form_holder)
         form.pack(fill="both", expand=True)
         for section in sections_for("mesh"):
@@ -132,6 +138,127 @@ class MeshTab(ttk.Frame):
     def reload_fields(self):
         for path, widget in self.fields.items():
             widget.set_value(self.app.state.get(path))
+        # a (re)loaded input.json is not necessarily on a profile any more
+        self.profile_var.set(PROFILE_CUSTOM)
+        self._refresh_profile_list()
+
+    # ----------------------------------------------------------- profiles
+    def _build_profile_bar(self, parent):
+        """Profile drop-down + save/delete, above the parameter form."""
+        bar = ttk.LabelFrame(parent, text=" Mesh profile ")
+        bar.pack(fill="x", padx=6, pady=(6, 2))
+        ttk.Label(bar, text="profile:").pack(side="left", padx=(4, 2))
+        self.profile_var = tk.StringVar(value=PROFILE_CUSTOM)
+        self.profile_box = ttk.Combobox(bar, textvariable=self.profile_var,
+                                        state="readonly", width=22)
+        self.profile_box.pack(side="left", padx=(0, 4))
+        self.profile_box.bind("<<ComboboxSelected>>",
+                              lambda _e: self._apply_selected_profile())
+        TooltipHelper(self.profile_box,
+                      "Mesh profiles stored in mesh_profiles.json. "
+                      "Choosing one applies all of its mesh-tab "
+                      "parameters to the current case (input.json is "
+                      "only written when you save the case or run a "
+                      "job). '(custom)' means the current values are "
+                      "not from a profile.")
+        self.profile_save_btn = ttk.Button(bar, text="Save", width=6,
+                                           command=self._profile_save)
+        self.profile_save_btn.pack(side="left", padx=2)
+        TooltipHelper(self.profile_save_btn,
+                      "Overwrite the selected profile with the current "
+                      "mesh-tab parameters. The shipped 'High Fidelity' "
+                      "and 'Optimization Mesh' profiles can be updated "
+                      "this way, but not deleted.")
+        self.profile_saveas_btn = ttk.Button(bar, text="Save as ...",
+                                             width=10,
+                                             command=self._profile_save_as)
+        self.profile_saveas_btn.pack(side="left", padx=2)
+        TooltipHelper(self.profile_saveas_btn,
+                      "Save the current mesh-tab parameters under a new "
+                      "profile name (or overwrite an existing one).")
+        self.profile_del_btn = ttk.Button(bar, text="Delete", width=7,
+                                          command=self._profile_delete)
+        self.profile_del_btn.pack(side="left", padx=2)
+        TooltipHelper(self.profile_del_btn,
+                      "Delete the selected profile. Protected profiles "
+                      "('High Fidelity', 'Optimization Mesh') cannot be "
+                      "deleted.")
+        if self.profiles.error:
+            for btn in (self.profile_save_btn, self.profile_saveas_btn,
+                        self.profile_del_btn):
+                btn.configure(state="disabled")
+            ttk.Label(bar, foreground="#b8860b",
+                      text="mesh_profiles.json is unreadable - shipped "
+                           "profiles only, editing disabled"
+                      ).pack(side="left", padx=(8, 0))
+        self._refresh_profile_list()
+
+    def _refresh_profile_list(self):
+        names = [PROFILE_CUSTOM] + self.profiles.names()
+        self.profile_box.configure(values=names)
+        if self.profile_var.get() not in names:
+            self.profile_var.set(PROFILE_CUSTOM)
+
+    def _selected_profile(self):
+        name = self.profile_var.get()
+        return None if name == PROFILE_CUSTOM else name
+
+    def _apply_selected_profile(self):
+        name = self._selected_profile()
+        if not name:
+            return
+        apply_values(self.app.state, self.profiles.values(name))
+        self.reload_fields()
+        self.profile_var.set(name)     # reload_fields resets the dropdown
+        self.app.set_status(f"mesh profile '{name}' applied")
+
+    def _profile_save(self):
+        name = self._selected_profile()
+        if name is None:
+            self._profile_save_as()
+            return
+        self.profiles.save(name, capture_values(self.app.state))
+        self._refresh_profile_list()
+        self.app.set_status(f"mesh profile '{name}' saved")
+
+    def _profile_save_as(self):
+        name = simpledialog.askstring(
+            "Save mesh profile", "Name for the mesh profile:",
+            initialvalue=self._selected_profile() or "", parent=self)
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if self.profiles.get(name) is not None \
+                and not messagebox.askyesno(
+                    "Overwrite mesh profile",
+                    f"Profile '{name}' already exists. Overwrite it with "
+                    "the current mesh parameters?", parent=self):
+            return
+        self.profiles.save(name, capture_values(self.app.state))
+        self._refresh_profile_list()
+        self.profile_var.set(name)
+        self.app.set_status(f"mesh profile '{name}' saved")
+
+    def _profile_delete(self):
+        name = self._selected_profile()
+        if name is None:
+            return
+        if self.profiles.type_of(name) == PROTECTED:
+            messagebox.showinfo(
+                "Protected mesh profile",
+                f"'{name}' is a protected profile - it cannot be deleted. "
+                "You can overwrite its values with 'Save' if you want to "
+                "change it.", parent=self)
+            return
+        if not messagebox.askyesno(
+                "Delete mesh profile",
+                f"Delete the mesh profile '{name}'?", parent=self):
+            return
+        self.profiles.delete(name)
+        self._refresh_profile_list()
+        self.app.set_status(f"mesh profile '{name}' deleted")
 
     # ------------------------------------------------------------ sources
     def _open_3d_view(self):

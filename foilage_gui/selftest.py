@@ -34,6 +34,60 @@ def test_schema():
             assert f.default in stored, f"default of {f.path} not in choices"
 
 
+def test_mesh_profiles():
+    from foilage_gui.mesh_profiles import (PROTECTED, USER, MeshProfiles,
+                                           apply_values, capture_values,
+                                           mesh_field_paths)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "sub" / "mesh_profiles.json"
+        mp = MeshProfiles(path)
+        assert mp.names()[:2] == ["High Fidelity", "Optimization Mesh"]
+        for name in ("High Fidelity", "Optimization Mesh"):
+            assert mp.type_of(name) == PROTECTED, name
+            missing = [p for p in mesh_field_paths()
+                       if p not in mp.values(name)]
+            assert not missing, f"{name}: profile misses {missing}"
+        assert path.exists(), "profile file was not seeded"
+
+        # reload is stable and re-seeds a hand-deleted protected profile
+        mp2 = MeshProfiles(path)
+        del mp2.profiles["High Fidelity"]
+        mp2.flush()
+        assert "High Fidelity" in MeshProfiles(path).names()
+
+        # values round-trip into a case state
+        state = CaseState(REPO / "cases" / "turbine_blade_9" / "input.json")
+        coarse = mp2.values("Optimization Mesh")
+        apply_values(state, coarse)
+        for p, v in coarse.items():
+            assert state.get(p) == v, p
+
+        # user profile: save, persist, delete
+        mine = capture_values(state)
+        mp2.save("mine", mine)
+        mp3 = MeshProfiles(path)
+        assert mp3.type_of("mine") == USER
+        assert mp3.values("mine") == mine
+        assert mp3.delete("High Fidelity") is False, "protected deleted"
+        assert mp3.delete("mine") is True
+        assert "mine" not in MeshProfiles(path).names()
+
+        # overwriting a protected profile keeps the protection
+        mp3.save("High Fidelity", mine)
+        mp4 = MeshProfiles(path)
+        assert mp4.type_of("High Fidelity") == PROTECTED
+        assert mp4.values("High Fidelity") == mine
+
+        # corrupt file: shipped defaults in memory, file left untouched
+        path.write_text("{oops")
+        mp5 = MeshProfiles(path)
+        assert mp5.error, "corrupt file must be reported"
+        assert "High Fidelity" in mp5.names() and "mine" not in mp5.names()
+        assert path.read_text() == "{oops"
+    print("mesh profiles OK (seed, apply, save/delete, protection, "
+          "corrupt-file fallback)")
+
+
 def test_state_roundtrip():
     inputs = sorted((REPO / "cases").glob("*/input.json"))
     assert inputs, "no case inputs found for the roundtrip test"
@@ -1523,6 +1577,7 @@ def test_mesh3d_parser():
 
 def main():
     test_schema()
+    test_mesh_profiles()
     test_state_roundtrip()
     test_validation()
     test_derived()

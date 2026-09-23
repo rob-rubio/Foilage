@@ -100,6 +100,18 @@ def smoke(app):
     mesh_tab = app._tabs[2]
     assert mesh_tab._current is not None, "mesh tab loaded no mesh"
     assert mesh_tab.info_var.get().count(",") >= 1
+    # mesh profiles: apply a shipped profile end-to-end and confirm the
+    # delete protection on it (no file mutation)
+    assert "High Fidelity" in mesh_tab.profiles.names()
+    mesh_tab.profile_var.set("High Fidelity")
+    mesh_tab._apply_selected_profile()
+    hf = mesh_tab.profiles.values("High Fidelity")
+    assert app.state.get("mesh.boundary_layer.n_layers") \
+        == hf["mesh.boundary_layer.n_layers"], "profile apply failed"
+    assert mesh_tab.profile_var.get() == "High Fidelity"
+    assert mesh_tab.profiles.delete("High Fidelity") is False, \
+        "protected profile was deletable"
+    print("smoke: mesh profiles OK (apply + delete protection)")
     sol = app._tabs[3]
     sol.reload_all()
     _pump(root, 20)

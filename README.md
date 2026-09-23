@@ -154,6 +154,10 @@ The **Cascade periodicity** dropdown in the Geometry tab's Domain panel selects 
 
 Unwrapped-y bookkeeping: in **axisymmetric** mode the design and mesh plane uses `uy`, while `.geomTurbo` files (and plugin output) carry **Cartesian y** (`y = R*sin(theta)` around the machine axis). Sections are therefore unwrapped (`uy = R*asin(y/R)`, about the blade's tangential center, with R = R1 in axial-chord units) when loaded by any method, and re-wrapped (`y = R*sin(uy/R)`) when saved via *Save as geomTurbo...* - the round trip is lossless. In **offset** and **freestream** modes no conversion takes place (periodics are either offset-free or absent).
 
+### Mesh profiles
+
+The Mesh tab's **Mesh profile** bar stores and re-applies complete mesh configurations. A profile captures every Mesh-tab parameter (far-field/near-wall/periodic sizes, algorithm, wall node count, boundary-layer stack, spanwise extrusion, wake refinement, and the plot zoom window) under a name in `mesh_profiles.json` next to `foilage.cfg`. Pick a profile from the drop-down to apply all of its values to the current case at once (the case is marked unsaved as usual - nothing is written until you save `input.json` or start a run); tweak parameters afterwards, then **Save** to overwrite the selected profile, **Save as ...** to store the current values under a new name, or **Delete** to remove a profile. Two shipped profiles are **protected**: *High Fidelity* (fine reference mesh: small sizes, 24 boundary-layer layers, 41 spanwise layers) and *Optimization Mesh* (coarse, fast mesh for optimization and ML sweeps). They can be selected and updated with **Save** like any other profile, but not deleted from the GUI - removing them requires hand-editing `mesh_profiles.json`, and a missing protected entry is re-seeded from the built-in defaults the next time the GUI starts. The file is plain JSON: add or edit profiles (including their `description`s) in any editor; unknown `values` keys are ignored, and a file that fails to parse falls back to the shipped profiles with editing disabled until it is repaired.
+
 
 ## How the pipeline works
 
@@ -304,6 +308,7 @@ sample/                     Example inputs and generated local sample artifacts
 resources/                  Project assets, including the Foilage logo
 foilage.cfg.example         Template for the local SU2 path
 foilage_config.py           Runtime configuration and SU2 resolution
+mesh_profiles.json          Saved Mesh-tab profiles (protected entries re-seed)
 requirements.txt            Python runtime dependencies
 THIRD_PARTY_NOTICES.md      Dependency license and attribution notices
 ```
